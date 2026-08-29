@@ -18,6 +18,12 @@ pub trait MeshTransport: ClusterTransport {
     fn publish(&mut self, from: &str, data: &str);
     /// Drain messages received from peers since the last poll.
     fn drain(&mut self) -> Vec<MeshMessage>;
+    /// Authorize an address to mesh — it will be ADMITTED at the identify handshake — WITHOUT opening
+    /// a socket or marking it connected. The daemon calls this for every role-gated roster peer on
+    /// `SetRoster` so an inbound connection is not dropped as unauthorized (the "authorize before
+    /// connect" ordering). The libp2p transport adds it to its authorized set; the single-node
+    /// in-process transport has no mesh, so this is a NO-OP (keeps `online` honest — never fabricated).
+    fn authorize(&mut self, addr: &str);
 }
 
 /// Single-node / loopback transport. Tracks who is "connected" (so the admission lifecycle + status
@@ -62,5 +68,8 @@ impl MeshTransport for InProcessTransport {
     }
     fn drain(&mut self) -> Vec<MeshMessage> {
         std::mem::take(&mut self.inbox)
+    }
+    fn authorize(&mut self, _addr: &str) {
+        // Single node: no mesh, nothing to authorize. `online` stays 0 (honest).
     }
 }

@@ -34,6 +34,22 @@ fn required(key: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Soak/ops helper: print this node's {address, peerId} from its seed, OFFLINE (no swarm), so the
+    // operator can build the peer's bootstrap multiaddr before starting. Reads CITRATE_CLUSTER_SEED_FILE.
+    if env::args().any(|a| a == "--print-identity") {
+        let seed_file = required("CITRATE_CLUSTER_SEED_FILE")?;
+        let seed_hex = fs::read_to_string(&seed_file)
+            .map_err(|e| format!("reading seed file {seed_file}: {e}"))?;
+        let seed_bytes =
+            hex::decode(seed_hex.trim()).map_err(|_| "seed must be hex".to_string())?;
+        let secret: [u8; 32] = seed_bytes
+            .try_into()
+            .map_err(|_| "seed must be 32 bytes".to_string())?;
+        let (address, peer_id) = Libp2pTransport::identity_from_secret(secret)?;
+        println!("{{\"address\":\"{address}\",\"peerId\":\"{peer_id}\"}}");
+        return Ok(());
+    }
+
     let socket = PathBuf::from(required("CITRATE_CLUSTER_SOCKET")?);
     let bearer_file = required("CITRATE_CLUSTER_BEARER_FILE")?;
     let bearer = fs::read_to_string(&bearer_file)

@@ -278,6 +278,18 @@ impl Libp2pTransport {
         })
     }
 
+    /// Derive `(address, peer_id)` from a 32-byte secp256k1 secret WITHOUT starting a swarm — so a
+    /// node can print its identity offline (to build the other node's bootstrap multiaddr for a soak,
+    /// and to verify the deterministic PeerId↔address binding). `try_from_bytes` zeroizes the buffer.
+    pub fn identity_from_secret(mut secret: [u8; 32]) -> Result<(String, String), TransportError> {
+        let secp_secret = identity::secp256k1::SecretKey::try_from_bytes(&mut secret)
+            .map_err(|e| TransportError::BadSecret(e.to_string()))?;
+        let keypair = identity::Keypair::from(identity::secp256k1::Keypair::from(secp_secret));
+        let address =
+            address_from_public_key(&keypair.public()).ok_or(TransportError::SelfAddress)?;
+        Ok((address, keypair.public().to_peer_id().to_string()))
+    }
+
     /// This node's canonical address (its cluster/comms/wallet identity).
     pub fn self_address(&self) -> &str {
         &self.self_address
@@ -351,6 +363,11 @@ impl MeshTransport for Libp2pTransport {
             .lock()
             .map(|mut s| std::mem::take(&mut s.inbox))
             .unwrap_or_default()
+    }
+    fn authorize(&mut self, addr: &str) {
+        // For libp2p, `dial` IS the authorize (adds to the authorized set; opens no socket). The
+        // socket comes from the bootstrap dial or the peer dialing us; identify then admits it.
+        self.dial(addr);
     }
 }
 

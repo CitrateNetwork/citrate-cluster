@@ -68,13 +68,22 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     }
 
     /// Set/update a group's roster: reconcile the mesh (recompute the allowed set + evict every
-    /// admitted peer no longer allowed, in one step). Returns the evicted peers.
+    /// admitted peer no longer allowed, in one step), then AUTHORIZE every role-gated roster peer in
+    /// the transport so its inbound connection is admitted at the identify handshake (the "authorize
+    /// before connect" ordering — without this the mesh drops every peer as unauthorized). Authorize
+    /// opens no socket and is a no-op for the single-node in-process transport. Returns the evicted.
     pub fn set_roster(
         &mut self,
         group: &str,
         roster: &[(String, String)],
     ) -> Result<Vec<String>, String> {
-        Ok(self.ensure_session(group).reconcile(roster))
+        let session = self.ensure_session(group);
+        let evicted = session.reconcile(roster);
+        let allowed = session.membership().allowed();
+        for addr in &allowed {
+            session.transport_mut().authorize(addr);
+        }
+        Ok(evicted)
     }
 
     /// This node joins the group's mesh. The real transport begins listening + dialing peers here;
