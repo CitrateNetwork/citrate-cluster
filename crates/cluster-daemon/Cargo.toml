@@ -1,0 +1,21 @@
+[package]
+name = "cluster-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "citrate-cluster daemon — a group's private P2P mesh (libp2p Noise + gossipsub) driven by the cluster-core admission gate, exposing a loopback UDS JSON IPC so a lean client (citrate-core) joins/reconciles/publishes without linking the networking tree."
+
+[[bin]]
+name = "cluster-daemon"
+path = "src/main.rs"
+
+[dependencies]
+cluster-core = { path = "../cluster-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+# Constant-time bearer comparison on the loopback IPC token (no `==` on the secret).
+subtle = "2"

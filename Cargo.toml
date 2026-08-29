@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/cluster-core", "crates/cluster-daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Citrate Network"]
+repository = "https://github.com/CitrateNetwork/citrate-cluster"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "2"

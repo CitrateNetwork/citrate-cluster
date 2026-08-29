@@ -1,0 +1,12 @@
+[package]
+name = "cluster-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "citrate-cluster — the RBAC->network admission core: roster->allowed_peers, the ClusterMembership state machine (admit/leave/reconcile-evict), and the ClusterTransport seam. Pure logic, NO libp2p/tokio — so it is reusable by the daemon AND lean clients (citrate-core)."
+
+[dependencies]
+
+[dev-dependencies]
