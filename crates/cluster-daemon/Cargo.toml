@@ -19,3 +19,9 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 # Constant-time bearer comparison on the loopback IPC token (no `==` on the secret).
 subtle = "2"
+# CL-S1: the real cross-machine mesh (Noise + gossipsub). These live in the daemon ONLY;
+# cluster-core must never link libp2p/tokio (CLAUDE.md rule 3 — verified in CI-equivalent grep).
+libp2p = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+sha3 = { workspace = true }

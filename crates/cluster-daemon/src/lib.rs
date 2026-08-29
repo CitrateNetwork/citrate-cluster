@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use cluster_core::ClusterSession;
 
 pub mod ipc;
+pub mod libp2p_transport;
 pub mod server;
 pub mod transport;
 
