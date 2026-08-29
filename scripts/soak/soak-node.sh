@@ -72,8 +72,6 @@ echo "▶ setRoster [self, peer] + join"
 $CTL set-roster "$GROUP" "$SELF_ADDR:member,$PEER_ADDR:member" >/dev/null
 $CTL join "$GROUP" >/dev/null
 
-[ -n "${SHARE_CID:-}" ] && { echo "▶ sharing CID $SHARE_CID"; $CTL share "$GROUP" "$SHARE_CID" >/dev/null; }
-
 echo "▶ polling status (want online>=1)…"
 ONLINE=0
 for i in $(seq 1 60); do
@@ -84,9 +82,19 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
+# Share AFTER the mesh has grafted — gossipsub does not replay a publish made to an empty mesh, so
+# sharing before online>=1 silently loses the co-pin. Then poll once more so the peer's share (if any)
+# has time to arrive in OUR sharedFiles.
+if [ "${ONLINE:-0}" -ge 1 ] && [ -n "${SHARE_CID:-}" ]; then
+  echo "▶ mesh up — sharing CID $SHARE_CID"
+  $CTL share "$GROUP" "$SHARE_CID" >/dev/null
+  for i in $(seq 1 6); do echo "   [share-poll $i] $($CTL status "$GROUP")"; sleep 2; done
+fi
+
 echo "──────────────────────────────────────────────────────────────────"
 if [ "${ONLINE:-0}" -ge 1 ]; then
-  echo " ✅ SOAK PASS — mesh formed (online=$ONLINE). Final status above shows sharedFiles."
+  echo " ✅ SOAK PASS — mesh formed (online=$ONLINE). Final status above shows sharedFiles (yours +"
+  echo "    any co-pin the peer shared AFTER the mesh grafted)."
 else
   echo " ❌ SOAK FAIL — peer never connected. Check: same GROUP, firewall allows TCP $PORT inbound,"
   echo "    correct PEER multiaddr (ip/port/peerId), both rosters include both addresses."
