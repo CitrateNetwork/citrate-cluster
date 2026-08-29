@@ -171,3 +171,57 @@ fn a_received_co_pin_shows_up_in_the_next_status_shared_files() {
     let (_, _, shared) = d.status("g1");
     assert_eq!(shared, vec!["aaaaself".to_string(), "bafypeer".to_string()]);
 }
+
+// CL-S3 regression: SetRoster must AUTHORIZE every role-gated roster peer in the transport (else the
+// libp2p mesh drops inbound peers as unauthorized). InProcessTransport::authorize is a no-op, so we
+// observe the calls with a recording transport (via a thread-local, since the factory is a bare fn).
+
+thread_local! {
+    static AUTHORIZED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct RecordingTransport;
+impl RecordingTransport {
+    fn new() -> Self {
+        RecordingTransport
+    }
+}
+impl cluster_core::ClusterTransport for RecordingTransport {
+    fn dial(&mut self, _peer: &str) {}
+    fn disconnect(&mut self, _peer: &str) {}
+    fn connected(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+impl crate::transport::MeshTransport for RecordingTransport {
+    fn publish(&mut self, _from: &str, _data: &str) {}
+    fn drain(&mut self) -> Vec<crate::ipc::MeshMessage> {
+        Vec::new()
+    }
+    fn authorize(&mut self, addr: &str) {
+        AUTHORIZED.with(|a| a.borrow_mut().push(addr.to_string()));
+    }
+}
+
+#[test]
+fn set_roster_authorizes_every_role_gated_peer_not_guests() {
+    AUTHORIZED.with(|a| a.borrow_mut().clear());
+    let mut d = ClusterDaemon::new(SELF, RecordingTransport::new);
+    d.set_roster("g", &roster(&[(A, "member"), (B, "admin"), (C, "guest")]))
+        .unwrap();
+    let mut got = AUTHORIZED.with(|a| a.borrow().clone());
+    got.sort();
+    got.dedup();
+    assert!(
+        got.contains(&A.to_string()),
+        "a member is authorized to mesh"
+    );
+    assert!(
+        got.contains(&B.to_string()),
+        "an admin is authorized to mesh"
+    );
+    assert!(
+        !got.contains(&C.to_string()),
+        "a guest is NOT authorized to mesh"
+    );
+}
