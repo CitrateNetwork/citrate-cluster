@@ -100,7 +100,16 @@ fn two_nodes_form_mesh_and_exchange_a_group_message() {
         "sender resolved from the authenticated secp256k1 key"
     );
 
-    // The wire tracks admission: A sees B connected and vice versa.
+    // The wire tracks admission: A sees B connected and vice versa. POLL for it — the
+    // ConnectionEstablished/identify events that populate `connected()` are async and can lag the
+    // first delivered gossipsub message by a beat (this was the source of the earlier flake).
+    let conn_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < conn_deadline {
+        if a.connected().contains(&addr_b) && b.connected().contains(&addr_a) {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
     assert!(a.connected().contains(&addr_b), "A meshed with B");
     assert!(b.connected().contains(&addr_a), "B meshed with A");
 }
