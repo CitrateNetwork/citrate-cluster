@@ -14,3 +14,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 thiserror = "2"
+# CL-S1 libp2p transport (cluster-daemon ONLY — cluster-core stays pure, no libp2p/tokio).
+# Pinned to the same versions the proven citrate-compute-pool transport uses (CL-4) so the
+# TCP + Noise + yamux + gossipsub pattern ports cleanly.
+libp2p = { version = "0.56", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "identify",
+    "macros",
+    "secp256k1",
+] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
+futures = "0.3"
+sha3 = "0.10"
