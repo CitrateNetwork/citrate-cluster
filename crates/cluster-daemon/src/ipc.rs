@@ -65,10 +65,14 @@ pub enum Response {
     Reconciled {
         evicted: Vec<String>,
     },
-    /// Mesh status: `online` connected of `total` authorized.
+    /// Mesh status: `online` connected of `total` authorized, plus the group's co-pinned shared
+    /// file set (`sharedFiles`, sorted+deduped CIDs — this node's announcements + peers' received
+    /// co-pins). Additive over `online`/`total`.
     Status {
         online: usize,
         total: usize,
+        #[serde(rename = "sharedFiles")]
+        shared_files: Vec<String>,
     },
     Peers {
         peers: Vec<PeerView>,
@@ -97,8 +101,12 @@ pub fn handle_request<T: MeshTransport>(daemon: &mut ClusterDaemon<T>, req: Requ
             Response::Ok
         }
         Request::Status { group } => {
-            let (online, total) = daemon.status(&group);
-            Response::Status { online, total }
+            let (online, total, shared_files) = daemon.status(&group);
+            Response::Status {
+                online,
+                total,
+                shared_files,
+            }
         }
         Request::Peers { group } => Response::Peers {
             peers: daemon.peers(&group),

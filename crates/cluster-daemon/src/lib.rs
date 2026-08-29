@@ -7,7 +7,7 @@
 //! connected AND cluster-core admits it. The RBAC→network boundary is enforced HERE, on every
 //! connection, by [`cluster_core`] — the transport can never mesh a peer the roster does not allow.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use cluster_core::ClusterSession;
 
@@ -26,6 +26,10 @@ pub struct ClusterDaemon<T: MeshTransport> {
     /// Factory for a fresh per-group transport (the libp2p impl opens a swarm per group topic).
     make_transport: fn() -> T,
     groups: HashMap<String, ClusterSession<T>>,
+    /// Per-group co-pinned shared file set: this node's `ShareFile` announcements plus every CID
+    /// received from a peer over the mesh, sorted+deduped. The source of truth for
+    /// `Status.sharedFiles`. Drained-into on `status()`/`poll()` (the daemon is request-driven).
+    shared_files: HashMap<String, BTreeSet<String>>,
 }
 
 impl<T: MeshTransport> ClusterDaemon<T> {
@@ -34,7 +38,26 @@ impl<T: MeshTransport> ClusterDaemon<T> {
             self_address: cluster_core::canonical_address(&self_address.into()).unwrap_or_default(),
             make_transport,
             groups: HashMap::new(),
+            shared_files: HashMap::new(),
         }
+    }
+
+    /// Drain the group's transport inbox into its co-pinned shared set (each received
+    /// `MeshMessage.data` is a peer's shared CID), returning the raw messages. The daemon has no
+    /// background loop, so this is called on `status()`/`poll()` — the only points a client reads
+    /// the mesh. Unknown group → `[]`.
+    fn drain_into_shared(&mut self, group: &str) -> Vec<MeshMessage> {
+        let Some(s) = self.groups.get_mut(group) else {
+            return Vec::new();
+        };
+        let messages = s.transport_mut().drain();
+        if !messages.is_empty() {
+            let set = self.shared_files.entry(group.to_string()).or_default();
+            for m in &messages {
+                set.insert(m.data.clone());
+            }
+        }
+        messages
     }
 
     fn ensure_session(&mut self, group: &str) -> &mut ClusterSession<T> {
@@ -61,19 +84,33 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         Ok(())
     }
 
-    /// This node leaves the group's mesh (drop the session; the transport tears down on drop).
+    /// This node leaves the group's mesh (drop the session; the transport tears down on drop). Also
+    /// forgets the group's co-pinned shared set so a later re-join starts clean.
     pub fn leave(&mut self, group: &str) {
         self.groups.remove(group);
+        self.shared_files.remove(group);
     }
 
-    /// `(connected, authorized)` for a group. Unknown group → `(0, 0)`.
-    pub fn status(&self, group: &str) -> (usize, usize) {
+    /// `(connected, authorized, sharedFiles)` for a group. Drains any newly-received mesh messages
+    /// into the group's co-pinned set first (the daemon is request-driven), so a co-pin received
+    /// since the last read shows up here. `sharedFiles` is sorted+deduped. Unknown group →
+    /// `(0, 0, [])`.
+    pub fn status(&mut self, group: &str) -> (usize, usize, Vec<String>) {
+        self.drain_into_shared(group);
         match self.groups.get(group) {
-            Some(s) => (
-                s.transport().connected().len(),
-                s.membership().allowed().len(),
-            ),
-            None => (0, 0),
+            Some(s) => {
+                let shared = self
+                    .shared_files
+                    .get(group)
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_default();
+                (
+                    s.transport().connected().len(),
+                    s.membership().allowed().len(),
+                    shared,
+                )
+            }
+            None => (0, 0, Vec::new()),
         }
     }
 
@@ -100,18 +137,21 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         match self.groups.get_mut(group) {
             Some(s) => {
                 s.transport_mut().publish(&from, cid);
+                self.shared_files
+                    .entry(group.to_string())
+                    .or_default()
+                    .insert(cid.to_string());
                 Ok(())
             }
             None => Err(format!("not in group {group}")),
         }
     }
 
-    /// Drain received mesh messages for a group. Unknown group → `[]`.
+    /// Drain received mesh messages for a group, accumulating each into the group's co-pinned set
+    /// (so `Status.sharedFiles` sees them) while still returning the raw messages. Unknown group →
+    /// `[]`.
     pub fn poll(&mut self, group: &str) -> Vec<MeshMessage> {
-        match self.groups.get_mut(group) {
-            Some(s) => s.transport_mut().drain(),
-            None => Vec::new(),
-        }
+        self.drain_into_shared(group)
     }
 
     // ---- hooks the transport (libp2p) calls on connection events ----
