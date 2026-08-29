@@ -1,44 +1,27 @@
-name: CI
+# created: 2026-08-28 | branch: main | author: Claude Opus 4.8, directed by @SaulBuilds | status: active
+# Honest CI for citrate-cluster: fmt + clippy (-D warnings) + workspace test + release build.
+# No private federation crate deps (cluster-core/daemon are self-contained), so no cross-repo token.
+name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  test:
-    name: fmt + clippy + test
+  rust:
+    name: rust (fmt, clippy, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (stable) + components
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
-
       - name: rustfmt
         run: cargo fmt --all --check
-
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: test
         run: cargo test --workspace --locked
-
-      - name: build release (bin)
+      - name: build release
         run: cargo build --release -p cluster-daemon
