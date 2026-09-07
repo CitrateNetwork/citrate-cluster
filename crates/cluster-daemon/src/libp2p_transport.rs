@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use futures::stream::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{gossipsub, identify, identity, noise, tcp, yamux};
+use libp2p::{connection_limits, gossipsub, identify, identity, noise, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder};
 use sha3::{Digest, Keccak256};
 use tokio::runtime::Runtime;
@@ -78,6 +78,13 @@ const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_millis(200);
 
 /// Idle connection timeout — keep an authorized-but-quiet peer meshed.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// CL-B-009: connection-limit caps. A cluster group is a small mesh, so a handful of peers is ample;
+/// these bound the inbound surface an off-roster host can force before admission drops it (each
+/// inbound connection costs a full Noise_XX handshake + a secp256k1 verify before `identify` runs).
+const MAX_ESTABLISHED_INCOMING: u32 = 64;
+const MAX_PENDING_INCOMING: u32 = 16;
+const MAX_ESTABLISHED_PER_PEER: u32 = 2;
 
 /// Errors from constructing / listening the transport. The [`ClusterTransport`] surface itself is
 /// infallible (the daemon drives it with `()` returns); all fallible work is in [`Libp2pTransport::new`].
@@ -164,6 +171,8 @@ pub struct Libp2pTransport {
 struct ClusterBehaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
+    /// CL-B-009: refuse connections past the caps before they cost a Noise handshake.
+    connection_limits: connection_limits::Behaviour,
 }
 
 impl Libp2pTransport {
@@ -195,7 +204,7 @@ impl Libp2pTransport {
         // All swarm construction must happen inside the runtime context (`.with_tokio()`), so build +
         // listen + spawn under `block_on`; the spawned task then runs on the runtime's worker threads.
         let build = rt.block_on(async move {
-            let mut swarm = build_swarm(keypair)?;
+            let mut swarm = build_swarm(keypair, &topic_task)?;
             let topic = gossipsub::IdentTopic::new(topic_task.clone());
             swarm
                 .behaviour_mut()
@@ -248,6 +257,9 @@ impl Libp2pTransport {
             .ok()
             .filter(|p| !p.is_empty())
             .ok_or("CITRATE_CLUSTER_SEED_FILE is required for the libp2p transport")?;
+        // CL-B-007: the seed file holds the 32-byte cluster identity secret — refuse to read it
+        // unless it is 0600 and owned by us (fail closed on a world/group-readable key file).
+        crate::assert_secure_file(&seed_file)?;
         // CL-B-001: the hex string and the decoded raw-secret bytes both carry key material — wrap
         // them in `Zeroizing` so they are wiped from the heap when they drop, not left un-scrubbed.
         let seed_hex_owned = Zeroizing::new(
@@ -389,12 +401,22 @@ impl MeshTransport for Libp2pTransport {
 
 /// Build the swarm: TCP + Noise + yamux, gossipsub (signed, strict) + identify. Must run inside a
 /// tokio runtime context.
-fn build_swarm(keypair: identity::Keypair) -> Result<Swarm<ClusterBehaviour>, TransportError> {
+fn build_swarm(
+    keypair: identity::Keypair,
+    group_id: &str,
+) -> Result<Swarm<ClusterBehaviour>, TransportError> {
+    // CL-B-009: bind the Noise session to the group by using the group id as the handshake prologue,
+    // so a session is cryptographically scoped to the cluster it claims — a peer serving a different
+    // group cannot complete a Noise handshake with us at all (the transport gains a notion of cluster
+    // it previously lacked; app-layer admission remains the authorization boundary).
+    let prologue = group_id.as_bytes().to_vec();
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default().nodelay(true),
-            noise::Config::new,
+            move |k: &identity::Keypair| {
+                noise::Config::new(k).map(|c| c.with_prologue(prologue.clone()))
+            },
             yamux::Config::default,
         )
         .map_err(|e| TransportError::Build(format!("tcp: {e}")))?
@@ -413,9 +435,18 @@ fn build_swarm(keypair: identity::Keypair) -> Result<Swarm<ClusterBehaviour>, Tr
                 IDENTIFY_PROTOCOL.into(),
                 key.public(),
             ));
+            // CL-B-009: cap the connection surface so an off-roster host cannot force unbounded Noise
+            // handshakes against the listen address.
+            let connection_limits = connection_limits::Behaviour::new(
+                connection_limits::ConnectionLimits::default()
+                    .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING))
+                    .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
+                    .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER)),
+            );
             Ok(ClusterBehaviour {
                 gossipsub,
                 identify,
+                connection_limits,
             })
         })
         .map_err(|e| TransportError::Build(format!("behaviour: {e}")))?

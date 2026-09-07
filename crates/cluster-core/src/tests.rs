@@ -154,6 +154,36 @@ impl ClusterTransport for FakeTransport {
     }
 }
 
+// CL-B-005: a transport that admits on the wire (libp2p `identify`) records `connected` without ever
+// calling `join`, leaving `admitted` empty and the predicates lying. `sync_admitted_from_wire`
+// reconciles `admitted` from `connected ∩ allowed` — truthful, and it can NEVER admit a peer the
+// roster does not allow (the intersection preserves `admitted ⊆ allowed`).
+#[test]
+fn sync_admitted_from_wire_reflects_connected_and_preserves_the_invariant() {
+    let mut s = ClusterSession::new(
+        &roster(&[(A, "member"), (B, "member")]),
+        FakeTransport::new(),
+    );
+    // Simulate the libp2p path: the transport meshes an allowed peer WITHOUT a `join` call, and even
+    // meshes a stranger (C, not in the roster) — as could happen in a connect→identify race window.
+    s.transport_mut().dial(A);
+    s.transport_mut().dial(C);
+    // Before syncing, admission is a lie: A is meshed but not admitted.
+    assert!(!s.membership().is_admitted(A));
+    assert!(!s.wire_tracks_admitted(), "connected ⊄ admitted before the sync");
+
+    s.sync_admitted_from_wire();
+    assert!(s.membership().is_admitted(A), "allowed, connected peer is admitted");
+    assert!(
+        !s.membership().is_admitted(C),
+        "a non-allowed peer is NEVER admitted, even if the wire connected it"
+    );
+    assert!(
+        s.membership().invariant_holds(),
+        "sync intersects with allowed → admitted ⊆ allowed"
+    );
+}
+
 #[test]
 fn admitting_dials_rejecting_does_not() {
     let mut s = ClusterSession::new(

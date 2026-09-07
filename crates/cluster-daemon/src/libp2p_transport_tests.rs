@@ -114,6 +114,64 @@ fn two_nodes_form_mesh_and_exchange_a_group_message() {
     assert!(b.connected().contains(&addr_a), "B meshed with A");
 }
 
+// CL-B-005 regression: on the real libp2p path admission is decided on the wire (at `identify`), not
+// through `ClusterSession::join`, so `admitted` stays empty and `wire_tracks_admitted()` / `is_admitted`
+// lie while peers are meshed. Driving `sync_admitted_from_wire()` (what the daemon does before every
+// read) makes them truthful WITHOUT weakening the invariant `admitted ⊆ allowed`.
+#[test]
+fn wire_admission_is_reflected_into_the_membership_predicates() {
+    use cluster_core::ClusterSession;
+    const GROUP: &str = "group-invariant";
+
+    let mut ta = transport(0x2A, GROUP, vec![]);
+    let a_listen = wait_listener(&ta);
+    let mut tb = transport(0x2B, GROUP, vec![]);
+    let _ = wait_listener(&tb);
+    let addr_a = ta.self_address().to_string();
+    let addr_b = tb.self_address().to_string();
+    assert_ne!(addr_a, addr_b);
+
+    // Both authorize each other's address (what the daemon's set_roster does via `authorize`).
+    ta.authorize(&addr_b);
+    tb.authorize(&addr_a);
+    // Connect: B dials A's listener.
+    tb.dial_multiaddr(a_listen).expect("B dials A");
+
+    let roster = vec![
+        (addr_a.clone(), "member".to_string()),
+        (addr_b.clone(), "member".to_string()),
+    ];
+    let mut sa = ClusterSession::new(&roster, ta);
+
+    // Wait for the mesh to form (A sees B connected).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if sa.transport().connected().contains(&addr_b) {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    assert!(
+        sa.transport().connected().contains(&addr_b),
+        "the mesh must form (B connected to A)"
+    );
+
+    // The fix: reconcile admission from the wire, then the predicates are truthful.
+    sa.sync_admitted_from_wire();
+    assert!(
+        sa.wire_tracks_admitted(),
+        "wire_tracks_admitted() must be truthful once admission is synced from the wire"
+    );
+    assert!(
+        sa.membership().is_admitted(&addr_b),
+        "the connected, allowed peer is reported admitted"
+    );
+    assert!(
+        sa.membership().invariant_holds(),
+        "admitted ⊆ allowed still holds after syncing from the wire"
+    );
+}
+
 #[test]
 fn an_unauthorized_inbound_peer_is_refused_on_the_wire() {
     const GROUP: &str = "group-admission";

@@ -27,3 +27,6 @@ futures = { workspace = true }
 sha3 = { workspace = true }
 # CL-B-001: zeroize the cluster identity secret + its hex/byte intermediates on drop.
 zeroize = { workspace = true }
+# CL-B-006/CL-B-007: umask the control socket at bind time, peer-uid check (getpeereid), and stat the
+# 0600 seed/bearer files before reading them. Already in the tree via tokio/libp2p; declared directly.
+libc = "0.2"

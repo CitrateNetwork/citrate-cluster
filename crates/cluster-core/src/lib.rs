@@ -158,6 +158,20 @@ impl ClusterMembership {
     pub fn invariant_holds(&self) -> bool {
         self.admitted.is_subset(&self.allowed)
     }
+
+    /// Reconcile the admitted set to `candidates ∩ allowed`. Used by a transport that admits peers on
+    /// the wire (the libp2p path) through its own authorized-set gate rather than through [`join`],
+    /// so the runtime predicates ([`is_admitted`](Self::is_admitted),
+    /// [`ClusterSession::wire_tracks_admitted`]) reflect reality instead of a permanently-empty
+    /// `admitted`. Intersecting with `allowed` preserves the safety invariant `admitted ⊆ allowed`
+    /// by construction — this can never admit a peer the roster does not allow. (CL-B-005)
+    pub fn sync_admitted(&mut self, candidates: &BTreeSet<String>) {
+        self.admitted = candidates
+            .iter()
+            .filter(|a| self.allowed.contains(*a))
+            .cloned()
+            .collect();
+    }
 }
 
 /// The cluster's network transport — the seam the membership lifecycle drives. `dial` opens a Noise
@@ -223,6 +237,19 @@ impl<T: ClusterTransport> ClusterSession<T> {
 
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    /// Reconcile `admitted` to the transport's live `connected` set (intersected with `allowed`)
+    /// WITHOUT touching the wire — it only records what the transport already admitted through its
+    /// own on-wire authorized-set gate. On the libp2p path admission is decided at the `identify`
+    /// handshake (not through [`join`](Self::join)), so without this the `admitted` set stays empty
+    /// while peers are meshed and [`is_admitted`](ClusterMembership::is_admitted) /
+    /// [`wire_tracks_admitted`](Self::wire_tracks_admitted) report false answers. The daemon calls
+    /// this before every read of the membership state so those predicates never lie. Because it
+    /// intersects with `allowed`, the invariant `admitted ⊆ allowed` is preserved. (CL-B-005)
+    pub fn sync_admitted_from_wire(&mut self) {
+        let connected: BTreeSet<String> = self.transport.connected().into_iter().collect();
+        self.membership.sync_admitted(&connected);
     }
 
     /// Whether the wire never contains an unadmitted peer (`connected ⊆ admitted`) — the safety
