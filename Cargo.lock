@@ -363,6 +363,7 @@ dependencies = [
  "cluster-core",
  "futures",
  "hex",
+ "libc",
  "libp2p",
  "serde",
  "serde_json",

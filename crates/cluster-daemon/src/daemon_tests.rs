@@ -124,6 +124,66 @@ fn handle_request_round_trips_the_contract() {
     }
 }
 
+// CL-B-002 regression: a group-pinned daemon (the libp2p one-group-per-daemon constraint, S1) must
+// refuse any group id other than its configured one with an explicit Error — never silently build a
+// second swarm on the same env topic/port/PeerId while judging peers against a different roster.
+#[test]
+fn a_group_pinned_daemon_refuses_a_second_group() {
+    let mut d = ClusterDaemon::new_single_group(SELF, InProcessTransport::new, "alpha");
+    // The configured group works.
+    assert!(d.set_roster("alpha", &roster(&[(A, "member")])).is_ok());
+    assert!(d.join("alpha").is_ok());
+    // A second, different group is refused on both session-creating ops.
+    assert!(
+        d.set_roster("beta", &roster(&[(A, "member")])).is_err(),
+        "setRoster on a second group must fail closed, not silently mis-wire"
+    );
+    assert!(
+        d.join("beta").is_err(),
+        "join on a second group must fail closed"
+    );
+    // And no phantom session was created for the refused group.
+    assert_eq!(d.status("beta"), (0, 0, Vec::<String>::new()));
+    assert!(d.peers("beta").is_empty());
+    // An un-pinned daemon (in-process, no wire) keeps multi-group behaviour.
+    let mut open = ClusterDaemon::new(SELF, InProcessTransport::new);
+    assert!(open.set_roster("g1", &roster(&[(A, "member")])).is_ok());
+    assert!(open.set_roster("g2", &roster(&[(B, "member")])).is_ok());
+}
+
+// CL-B-007: a secret file (seed / bearer) must be refused unless it is 0600 and owned by us, so a
+// packaging bug or a `umask 0` service manager cannot leave the cluster identity secret world-readable
+// while the daemon starts happily.
+#[cfg(unix)]
+#[test]
+fn assert_secure_file_fails_closed_on_group_or_world_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::env::temp_dir().join(format!("clb007-{}.seed", std::process::id()));
+    std::fs::write(&p, "deadbeef").unwrap();
+    let path = p.to_str().unwrap();
+
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        crate::assert_secure_file(path).is_ok(),
+        "0600 owned by us is accepted"
+    );
+
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = crate::assert_secure_file(path).unwrap_err();
+    assert!(
+        err.contains("0600") || err.contains("accessible"),
+        "a world-readable secret file must fail closed: {err}"
+    );
+
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(
+        crate::assert_secure_file(path).is_err(),
+        "a group-readable secret file must fail closed"
+    );
+
+    let _ = std::fs::remove_file(&p);
+}
+
 #[test]
 fn in_process_transport_delivers_and_drains() {
     let mut t = InProcessTransport::new();

@@ -57,6 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket = PathBuf::from(required("CITRATE_CLUSTER_SOCKET")?);
     let bearer_file = required("CITRATE_CLUSTER_BEARER_FILE")?;
+    // CL-B-007: the bearer file is a secret — refuse to read it unless it is 0600 and owned by us.
+    cluster_daemon::assert_secure_file(&bearer_file)?;
     let bearer = fs::read_to_string(&bearer_file)
         .map_err(|e| format!("reading bearer file {bearer_file}: {e}"))?
         .trim()
@@ -73,9 +75,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in-process. Both slot behind the same MeshTransport seam — the daemon logic is identical.
     if env::var("CITRATE_CLUSTER_LISTEN").is_ok() {
         // Pre-validate the libp2p env here so the lazy per-group factory's `expect` never fires on
-        // bad config — fail closed at startup with a clear message instead.
-        Libp2pTransport::config_from_env().map_err(|e| format!("libp2p transport config: {e}"))?;
-        let daemon = ClusterDaemon::new(self_addr, Libp2pTransport::from_env);
+        // bad config — fail closed at startup with a clear message instead. (Also stats the 0600 seed
+        // file per CL-B-007.)
+        let cfg =
+            Libp2pTransport::config_from_env().map_err(|e| format!("libp2p transport config: {e}"))?;
+        let group = cfg.group_id.clone();
+        // CL-B-007: the identity the daemon advertises (SELF_ADDR) must equal the identity derived
+        // from the seed file, or the node reports one address locally while presenting another on the
+        // wire. `identity_from_secret` takes the secret by value and zeroizes its copy; `cfg` wipes
+        // the original on drop (CL-B-001).
+        let (derived_addr, _) = Libp2pTransport::identity_from_secret(cfg.secret)
+            .map_err(|e| format!("deriving identity from the seed: {e}"))?;
+        drop(cfg);
+        let want = cluster_core::canonical_address(&self_addr).expect("SELF_ADDR validated above");
+        if derived_addr != want {
+            return Err(format!(
+                "CITRATE_CLUSTER_SELF_ADDR ({want}) does not match the address derived from the seed file ({derived_addr}) — fail closed"
+            )
+            .into());
+        }
+        // CL-B-002: pin the daemon to the single configured group — a second group id is refused
+        // rather than silently built on the same env topic/port/PeerId.
+        let daemon = ClusterDaemon::new_single_group(self_addr, Libp2pTransport::from_env, group);
         server::serve(daemon, &socket, &bearer)?;
     } else {
         let daemon = ClusterDaemon::new(self_addr, InProcessTransport::new);

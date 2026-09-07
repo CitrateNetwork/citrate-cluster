@@ -7,7 +7,9 @@
 # the mesh forms (online >= 1) and a co-pinned CID propagates.
 #
 # Config via env:
-#   SEED        64-hex secp256k1 secret for THIS node (each node MUST differ)              [required]
+#   SEED_FILE   path to a 0600 file holding THIS node's 64-hex secp256k1 secret (unique per node)
+#               — the raw secret NEVER crosses argv/env (they leak to `ps` and /proc/<pid>/environ,
+#               and are inherited by the daemon); it is only ever a file path (CLAUDE.md rule 4).  [required]
 #   GROUP       shared group id == gossipsub topic (BOTH nodes identical)                  [required]
 #   PORT        libp2p TCP listen port (fixed so the peer can bootstrap; default 4201)
 #   PEER        the OTHER node's bootstrap multiaddr /ip4/<ip>/tcp/<port>/p2p/<PeerId>     [required]
@@ -22,15 +24,22 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${CLUSTER_BIN:-$REPO_ROOT/target/release/cluster-daemon}"
 PORT="${PORT:-4201}"
 GROUP="${GROUP:?set GROUP (same on both nodes)}"
-SEED="${SEED:?set SEED (64-hex, unique per node)}"
+# CL-B-008: the seed is taken as a FILE PATH, never as a raw value in the environment (which leaks to
+# `ps`/`/proc/<pid>/environ` and is inherited by the daemon). Any legacy SEED env var is unset so it
+# can never reach the spawned binary.
+SEED_FILE="${SEED_FILE:?set SEED_FILE (path to a 0600 file holding this node 64-hex secret, unique per node)}"
+unset SEED 2>/dev/null || true
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 [ -x "$BIN" ] || die "cluster-daemon not found/executable at $BIN — build it: cargo build --release -p cluster-daemon (set CLUSTER_BIN)"
+[ -r "$SEED_FILE" ] || die "SEED_FILE $SEED_FILE not found/readable"
 
 WORK="$(mktemp -d)"
 trap 'kill "${DPID:-}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
-printf '%s' "$SEED" > "$WORK/seed"; chmod 600 "$WORK/seed"
-head -c32 /dev/urandom | (xxd -p 2>/dev/null || od -An -tx1 | tr -d ' \n') | tr -d '\n' > "$WORK/bearer"; chmod 600 "$WORK/bearer"
+# Copy the seed into the work dir as 0600 from creation (install -m 600 sets the mode atomically —
+# no write-before-chmod window) and mint a bearer under a restrictive umask.
+install -m 600 "$SEED_FILE" "$WORK/seed" || die "could not stage seed file"
+( umask 077; head -c32 /dev/urandom | (xxd -p 2>/dev/null || od -An -tx1 | tr -d ' \n') | tr -d '\n' > "$WORK/bearer" )
 SOCK="$WORK/cluster.sock"
 
 # Identity (offline) + this node's LAN IP → the bootstrap addr to hand the other operator.

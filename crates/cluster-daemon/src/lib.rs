@@ -19,12 +19,50 @@ pub mod transport;
 use ipc::{MeshMessage, PeerView};
 use transport::MeshTransport;
 
+/// CL-B-007: refuse to read a secret file (the seed, the bearer) unless it is `0600` and owned by the
+/// daemon's own uid. A packaging bug, a `umask 0` service manager, or a client that writes the file
+/// before `chmod`-ing it otherwise leaves the 32-byte cluster identity secret (or the bearer)
+/// readable by every local user while the daemon starts happily and reports healthy. Fails closed.
+#[cfg(unix)]
+pub fn assert_secure_file(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).map_err(|e| format!("stat secret file {path}: {e}"))?;
+    let mode = md.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "secret file {path} is group/world-accessible (mode {mode:04o}); it must be 0600 — fail closed"
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if md.uid() != euid {
+        return Err(format!(
+            "secret file {path} is owned by uid {} not the daemon's uid {euid} — fail closed",
+            md.uid()
+        ));
+    }
+    Ok(())
+}
+
+/// Non-unix fallback: no POSIX mode/owner to check.
+#[cfg(not(unix))]
+pub fn assert_secure_file(_path: &str) -> Result<(), String> {
+    Ok(())
+}
+
 /// The daemon: this node's address + a session per group.
 pub struct ClusterDaemon<T: MeshTransport> {
     /// This node's canonical member address (its comms/cluster identity — the gossipsub sender).
     self_address: String,
     /// Factory for a fresh per-group transport (the libp2p impl opens a swarm per group topic).
     make_transport: fn() -> T,
+    /// CL-B-002: when `Some(g)`, this daemon is pinned to the single group `g` and REFUSES every
+    /// other group id. The libp2p transport factory (`fn() -> T`) carries no group id, so a second
+    /// group would silently build another swarm bound to the SAME env-configured topic, port and
+    /// PeerId while judging peers against a different roster — a silent mesh mis-wiring. The daemon
+    /// is documented "one group per daemon in S1"; this enforces that constraint fail-closed rather
+    /// than relying on the client to honour it. `None` for the single-node in-process transport,
+    /// which has no wire and no such constraint.
+    single_group: Option<String>,
     groups: HashMap<String, ClusterSession<T>>,
     /// Per-group co-pinned shared file set: this node's `ShareFile` announcements plus every CID
     /// received from a peer over the mesh, sorted+deduped. The source of truth for
@@ -37,8 +75,45 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         ClusterDaemon {
             self_address: cluster_core::canonical_address(&self_address.into()).unwrap_or_default(),
             make_transport,
+            single_group: None,
             groups: HashMap::new(),
             shared_files: HashMap::new(),
+        }
+    }
+
+    /// Like [`new`](Self::new) but pins the daemon to a single group id (CL-B-002): every operation
+    /// addressing a different group is refused with an explicit error, so the libp2p transport — whose
+    /// `fn() -> T` factory carries no group id — can never silently build a second swarm on the same
+    /// configured topic/port/PeerId. `main.rs` uses this for the libp2p path (`CITRATE_CLUSTER_GROUP`).
+    pub fn new_single_group(
+        self_address: impl Into<String>,
+        make_transport: fn() -> T,
+        group: impl Into<String>,
+    ) -> Self {
+        ClusterDaemon {
+            single_group: Some(group.into()),
+            ..Self::new(self_address, make_transport)
+        }
+    }
+
+    /// Fail closed if `group` is not the daemon's pinned single group (CL-B-002). A no-op when the
+    /// daemon is not group-pinned (the in-process transport).
+    fn ensure_group_allowed(&self, group: &str) -> Result<(), String> {
+        match &self.single_group {
+            Some(g) if g != group => Err(format!(
+                "this daemon serves only group {g:?} (libp2p one-group-per-daemon, S1); refusing group {group:?}"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// CL-B-005: reconcile a group's `admitted` set to what the transport has actually meshed, so the
+    /// runtime admission predicates stay truthful on the libp2p path (where admission happens on the
+    /// wire at `identify`, not through `ClusterSession::join`). Called before every read of a group's
+    /// state. No-op for an unknown group.
+    fn sync_admission(&mut self, group: &str) {
+        if let Some(s) = self.groups.get_mut(group) {
+            s.sync_admitted_from_wire();
         }
     }
 
@@ -77,6 +152,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         group: &str,
         roster: &[(String, String)],
     ) -> Result<Vec<String>, String> {
+        self.ensure_group_allowed(group)?;
         let session = self.ensure_session(group);
         let evicted = session.reconcile(roster);
         let allowed = session.membership().allowed();
@@ -89,6 +165,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// This node joins the group's mesh. The real transport begins listening + dialing peers here;
     /// for now it ensures the group's session exists so subsequent ops address it.
     pub fn join(&mut self, group: &str) -> Result<(), String> {
+        self.ensure_group_allowed(group)?;
         self.ensure_session(group);
         Ok(())
     }
@@ -105,6 +182,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// since the last read shows up here. `sharedFiles` is sorted+deduped. Unknown group →
     /// `(0, 0, [])`.
     pub fn status(&mut self, group: &str) -> (usize, usize, Vec<String>) {
+        self.sync_admission(group);
         self.drain_into_shared(group);
         match self.groups.get(group) {
             Some(s) => {
@@ -124,7 +202,8 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     }
 
     /// The group's authorized peers, each with its live connection state. Unknown group → `[]`.
-    pub fn peers(&self, group: &str) -> Vec<PeerView> {
+    pub fn peers(&mut self, group: &str) -> Vec<PeerView> {
+        self.sync_admission(group);
         let Some(s) = self.groups.get(group) else {
             return Vec::new();
         };
@@ -160,6 +239,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// (so `Status.sharedFiles` sees them) while still returning the raw messages. Unknown group →
     /// `[]`.
     pub fn poll(&mut self, group: &str) -> Vec<MeshMessage> {
+        self.sync_admission(group);
         self.drain_into_shared(group)
     }
 
