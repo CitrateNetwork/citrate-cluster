@@ -25,3 +25,5 @@ libp2p = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 sha3 = { workspace = true }
+# CL-B-001: zeroize the cluster identity secret + its hex/byte intermediates on drop.
+zeroize = { workspace = true }

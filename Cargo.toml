@@ -30,3 +30,5 @@ libp2p = { version = "0.56", features = [
 tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
 futures = "0.3"
 sha3 = "0.10"
+# CL-B-001: wipe the 32-byte secp256k1 cluster secret (and its hex/Vec intermediates) from heap/stack.
+zeroize = { version = "1", features = ["zeroize_derive"] }
