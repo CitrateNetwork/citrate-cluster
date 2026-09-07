@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use cluster_daemon::libp2p_transport::Libp2pTransport;
 use cluster_daemon::transport::InProcessTransport;
 use cluster_daemon::{server, ClusterDaemon};
+use zeroize::{Zeroize, Zeroizing};
 
 fn required(key: &str) -> Result<String, String> {
     env::var(key).map_err(|_| format!("{key} is required"))
@@ -38,14 +39,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // operator can build the peer's bootstrap multiaddr before starting. Reads CITRATE_CLUSTER_SEED_FILE.
     if env::args().any(|a| a == "--print-identity") {
         let seed_file = required("CITRATE_CLUSTER_SEED_FILE")?;
-        let seed_hex = fs::read_to_string(&seed_file)
-            .map_err(|e| format!("reading seed file {seed_file}: {e}"))?;
+        // CL-B-001: wipe the hex string, decoded bytes, and the `[u8; 32]` copy handed to
+        // `identity_from_secret` (which takes it by value/`Copy`, so the local retains a live copy).
+        let seed_hex = Zeroizing::new(
+            fs::read_to_string(&seed_file)
+                .map_err(|e| format!("reading seed file {seed_file}: {e}"))?,
+        );
         let seed_bytes =
-            hex::decode(seed_hex.trim()).map_err(|_| "seed must be hex".to_string())?;
-        let secret: [u8; 32] = seed_bytes
-            .try_into()
+            Zeroizing::new(hex::decode(seed_hex.trim()).map_err(|_| "seed must be hex".to_string())?);
+        let mut secret: [u8; 32] = <[u8; 32]>::try_from(seed_bytes.as_slice())
             .map_err(|_| "seed must be 32 bytes".to_string())?;
         let (address, peer_id) = Libp2pTransport::identity_from_secret(secret)?;
+        secret.zeroize();
         println!("{{\"address\":\"{address}\",\"peerId\":\"{peer_id}\"}}");
         return Ok(());
     }

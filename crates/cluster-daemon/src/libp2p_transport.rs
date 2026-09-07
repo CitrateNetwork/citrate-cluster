@@ -63,6 +63,7 @@ use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder};
 use sha3::{Digest, Keccak256};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
+use zeroize::{Zeroize, Zeroizing};
 
 use cluster_core::{canonical_address, ClusterTransport};
 
@@ -101,7 +102,8 @@ pub enum TransportError {
 /// Construction config for a group's libp2p mesh transport.
 pub struct Libp2pConfig {
     /// The member's 32-byte secp256k1 secret (its wallet/comms/cluster key — CL-2). NEVER inline in
-    /// argv/env: read from a 0600 file (`CITRATE_CLUSTER_SEED_FILE`). Zeroized once the keypair is built.
+    /// argv/env: read from a 0600 file (`CITRATE_CLUSTER_SEED_FILE`). Wiped from memory when this
+    /// `Libp2pConfig` is dropped (see the `Drop` impl below — CL-B-001).
     pub secret: [u8; 32],
     /// The multiaddr to listen on (e.g. `/ip4/0.0.0.0/tcp/0`). `CITRATE_CLUSTER_LISTEN`.
     pub listen: Multiaddr,
@@ -110,6 +112,15 @@ pub struct Libp2pConfig {
     /// Static bootstrap peers to dial on startup (the "chain-derived bootstrap"). Errors are tolerated
     /// (a peer may not be up yet); inbound admission still gates every connection.
     pub bootstrap: Vec<Multiaddr>,
+}
+
+/// CL-B-001: scrub the 32-byte secp256k1 secret from memory when the config is dropped. A manual
+/// `Drop` (not `#[derive(ZeroizeOnDrop)]`) because the other fields (`Multiaddr`, `String`, `Vec`)
+/// are not `Zeroize`; only `secret` carries key material and needs wiping.
+impl Drop for Libp2pConfig {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
 }
 
 /// Commands the sync surface hands to the swarm task.
@@ -161,9 +172,10 @@ impl Libp2pTransport {
     /// and spawns the driver task before returning.
     pub fn new(cfg: Libp2pConfig) -> Result<Self, TransportError> {
         // Build the libp2p identity from the member's secp256k1 secret (CL-2). `try_from_bytes`
-        // zeroizes the buffer we pass, so the raw secret does not linger.
-        let mut secret_buf = cfg.secret;
-        let secp_secret = identity::secp256k1::SecretKey::try_from_bytes(&mut secret_buf)
+        // zeroizes the buffer we pass; `Zeroizing` also wipes it on the error path, and `cfg` (whose
+        // `secret` is a copy) is wiped by its `Drop` when `new` returns (CL-B-001).
+        let mut secret_buf = Zeroizing::new(cfg.secret);
+        let secp_secret = identity::secp256k1::SecretKey::try_from_bytes(&mut *secret_buf)
             .map_err(|e| TransportError::BadSecret(e.to_string()))?;
         let secp_keypair = identity::secp256k1::Keypair::from(secp_secret);
         let keypair = identity::Keypair::from(secp_keypair);
@@ -236,15 +248,19 @@ impl Libp2pTransport {
             .ok()
             .filter(|p| !p.is_empty())
             .ok_or("CITRATE_CLUSTER_SEED_FILE is required for the libp2p transport")?;
-        let seed_hex = std::fs::read_to_string(&seed_file)
-            .map_err(|e| format!("reading seed file {seed_file}: {e}"))?;
-        let seed_hex = seed_hex.trim();
+        // CL-B-001: the hex string and the decoded raw-secret bytes both carry key material — wrap
+        // them in `Zeroizing` so they are wiped from the heap when they drop, not left un-scrubbed.
+        let seed_hex_owned = Zeroizing::new(
+            std::fs::read_to_string(&seed_file)
+                .map_err(|e| format!("reading seed file {seed_file}: {e}"))?,
+        );
+        let seed_hex = seed_hex_owned.trim();
         if seed_hex.is_empty() {
             return Err("seed file is empty (fail closed)".into());
         }
-        let seed_bytes = hex::decode(seed_hex).map_err(|_| "seed must be hex".to_string())?;
-        let secret: [u8; 32] = seed_bytes
-            .try_into()
+        let seed_bytes =
+            Zeroizing::new(hex::decode(seed_hex).map_err(|_| "seed must be hex".to_string())?);
+        let secret: [u8; 32] = <[u8; 32]>::try_from(seed_bytes.as_slice())
             .map_err(|_| "seed must be 32 bytes".to_string())?;
 
         let listen: Multiaddr = std::env::var("CITRATE_CLUSTER_LISTEN")
