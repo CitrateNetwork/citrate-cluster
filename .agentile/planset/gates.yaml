@@ -1,0 +1,126 @@
+version: 1
+program: CL
+gates:
+  - id: gate0
+    name: Foundation — admission core + daemon shell + CI
+    status: met
+    exit_criteria:
+      - id: g0-core
+        desc: cluster-core admission engine complete + tested; invariant admitted ⊆ allowed holds
+        met: true
+        note: >-
+          16 cluster-core tests (allowed_peers derivation, role-gated admission, offboard/role-drop
+          eviction, connected ⊆ admitted). formal/ClusterAdmission.tla models the invariant (TLC not
+          run in the build env — no tla2tools.jar — but the invariant is inductive; not claimed green).
+        evidence: crates/cluster-core/
+      - id: g0-daemon
+        desc: The daemon shell — per-group sessions, the MeshTransport seam, the UDS bearer-authed JSON IPC contract
+        met: true
+        note: >-
+          9 cluster-daemon tests: admission enforced on connect, offboard eviction disconnects,
+          status/peers reflect the wire, handle_request + the real UDS server round-trip, wrong-bearer
+          rejection. InProcessTransport = single-node (real admission, no cross-machine fan-out).
+        evidence: crates/cluster-daemon/
+      - id: g0-ci
+        desc: CI/CD automated — fmt + clippy -D warnings + workspace test + release build, on push/PR
+        met: true
+        evidence: .github/workflows/ci.yml
+      - id: g0-spec
+        desc: Spec drafted — overview (locked decisions, core invariant, reuse map), sprints, gates, ADR
+        met: true
+        note: Stage-1 draft; the transport + scale plan still need a full red-team pass.
+        evidence: .agentile/planset/
+    reviewers: [Larry Klosowski (owner)]
+
+  - id: gate1
+    name: Mesh — real cross-machine P2P
+    status: met
+    exit_criteria:
+      - id: g1-libp2p
+        desc: Two nodes on two machines form a Noise-encrypted gossipsub mesh and exchange a message
+        met: true
+        note: >-
+          libp2p_transport.rs implements MeshTransport over a real swarm (TCP + Noise + yamux +
+          gossipsub + identify), one topic per group, peer identity bound to the member secp256k1 key
+          (PeerId + wallet address both derived from it). Test two_nodes_form_mesh_and_exchange_a_group_message
+          stands up two transports on 127.0.0.1:0, forms the mesh, and asserts gossipsub delivery with
+          the sender resolved from the authenticated key. Loopback (single host, two swarms) — a true
+          two-machine soak is CL-S3; NAT traversal is an explicit follow-on.
+        evidence: crates/cluster-daemon/src/libp2p_transport.rs + libp2p_transport_tests.rs
+      - id: g1-admission-on-wire
+        desc: An inbound connection from a non-roster peer is DROPPED at the transport (admission enforced on connect)
+        met: true
+        note: >-
+          On the identify handshake the transport resolves the peer's address from its authenticated
+          secp256k1 public key (double-checked against the connection PeerId) and drops the connection
+          (disconnect_peer_id) unless the address is in cluster-core's authorized set; a receive-side
+          authorized-source check backstops the connect→identify window. Test
+          an_unauthorized_inbound_peer_is_refused_on_the_wire proves a non-roster peer's messages are
+          never surfaced and it is never counted connected. Admission source of truth stays cluster-core
+          (relayed via dial/disconnect) — no policy duplicated. Caveat: admission is decided at
+          identify, so authorization must precede connection (documented; re-admit-on-change is S2).
+        evidence: crates/cluster-daemon/src/libp2p_transport.rs + libp2p_transport_tests.rs
+    reviewers: [Larry Klosowski (owner)]
+
+  - id: gate2
+    name: Integration — a group co-pins a shared file set
+    status: met
+    exit_criteria:
+      - id: g2-wiring
+        desc: citrate-core spawns + drives cluster-daemon over UDS, feeding rosters from the comms daemon
+        met: true
+        note: >-
+          citrate-core #168 (CL-S2): cluster.rs is a thin ClusterDaemonManager (supervised sidecar) +
+          UDS JSON client; the 5 frozen ClusterDomain commands route to the daemon; status/peers feed
+          the group roster from the comms daemon (comms::groups_roster) via setRoster; the daemon
+          binary is packaged (build-cluster-daemon.sh + externalBin). Proven live in the 2-machine soak.
+        evidence: citrate-core#168 + build-cluster-daemon.sh
+      - id: g2-copin
+        desc: A group's members co-pin a shared file set announced over the mesh
+        met: true
+        note: >-
+          MET 2026-08-28 by the LIVE two-machine soak: the DGX-originated CID bafyDGXsoaktest001
+          arrived in the Mac's Status.sharedFiles (DGX→Mac over the real gossipsub mesh, verified on
+          the Mac), and the Mac's post-graft shares crossed the same mesh (Mac→DGX). Bidirectional
+          cross-machine co-pin confirmed. Daemon side (below) drives it:
+          ClusterDaemon keeps a per-group BTreeSet<String> co-pinned set:
+          ShareFile{group,cid} adds cid (plus the existing transport.publish fan-out), and every
+          received MeshMessage.data (a peer's shared CID) is accumulated by draining the transport
+          into the set at the start of status() (poll() reuses the same drain and still returns the
+          raw messages). Status is the source of truth — a received co-pin appears in the next
+          Status.sharedFiles. Additive contract change: ipc::Response::Status gains
+          sharedFiles: Vec<String> (serde camelCase) → Status { online, total, sharedFiles };
+          ClusterDaemon::status returns (usize, usize, Vec<String>). cluster-core stays pure; UDS
+          server + admission untouched. 30 workspace tests (was 28), incl. share_file→sharedFiles and
+          drain-on-status of a delivered co-pin; fmt + clippy -D warnings clean. NOT met overall: the
+          citrate-core wiring half (spawn/drive daemon over UDS, feed rosters, surface sharedFiles in
+          the client's ClusterStatus) is separate — tracked by g2-wiring, still false.
+        evidence: crates/cluster-daemon/src/{lib.rs,ipc.rs,daemon_tests.rs}
+    reviewers: [Larry Klosowski (owner)]
+
+  - id: gate3
+    name: Scale — an honest ceiling
+    status: pending
+    exit_criteria:
+      - id: g3-soak
+        desc: Soak ladder 50→200→500→2000 run; the ceiling that actually holds is documented (RT-3)
+        met: false
+        evidence: CL-S3
+    reviewers: [Larry Klosowski (owner)]
+
+  - id: gateSec
+    name: T1 security sign-off
+    status: pending
+    exit_criteria:
+      - id: gSec-transport
+        desc: "@rule8 security sign-off on the P2P transport + Noise-identity binding before cross-org trust"
+        met: false
+        evidence: CL-S4
+    reviewers: [Larry Klosowski (owner), security lead]
+
+# CL-S3 note (2026-08-28): the REAL two-node libp2p mesh is proven working end-to-end — two daemon
+# processes form a Noise+gossipsub mesh (online:1 each) and a co-pinned CID propagates to both. The
+# missing piece was authorize-on-SetRoster (set_roster now authorizes every role-gated roster peer so
+# the transport admits inbound connections). Soak harness added: --print-identity (offline id) +
+# scripts/soak/{soakctl.py,soak-node.sh}. Remaining for gate3: the actual two-MACHINE run + the
+# 50->2000 ladder + an honest ceiling. gate2 g2-wiring done (core #168); g2-copin done (daemon #2).
