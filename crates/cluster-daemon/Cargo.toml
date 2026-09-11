@@ -19,6 +19,10 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 # Constant-time bearer comparison on the loopback IPC token (no `==` on the secret).
 subtle = "2"
+# Cross-platform local IPC (issue #1): a Unix-domain socket on Unix, a Windows named pipe on Windows,
+# behind one `local_socket` seam. The IPC server is std-sync/blocking (one thread per connection), so
+# the sync API is used — NOT the "tokio" feature (which is only for libp2p, a separate seam).
+interprocess = "2"
 # CL-S1: the real cross-machine mesh (Noise + gossipsub). These live in the daemon ONLY;
 # cluster-core must never link libp2p/tokio (CLAUDE.md rule 3 — verified in CI-equivalent grep).
 libp2p = { workspace = true }
