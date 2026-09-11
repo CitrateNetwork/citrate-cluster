@@ -1,5 +1,7 @@
 # citrate-cluster
 
+*Part of the **[Citrate Network](https://citrate.ai)** — own the means of computation. · [Docs](https://docs.citrate.ai) · [Run a node](https://citrate.ai/download) · [Contribute → free membership](https://github.com/CitrateNetwork/.github/blob/main/CONTRIBUTING.md)*
+
 > The group private P2P cluster daemon for the Citrate Network — a Noise-encrypted
 > libp2p mesh among a group's members with one hard guarantee: no unauthorized
 > peer is ever in the mesh. A lean client (e.g. citrate-core) feeds it a roster
