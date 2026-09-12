@@ -3,11 +3,21 @@
 
 use super::*;
 use crate::transport::InProcessTransport;
+use interprocess::local_socket::Stream;
+use interprocess::TryClone;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 const A: &str = "00000000000000000000000000000000000000aa";
+
+/// Connect to the server through the SAME endpoint rule the daemon binds with (issue #1) — on Unix
+/// this is the Unix-domain socket at `sock`; the citrate-core client applies the identical rule.
+fn connect(sock: &Path) -> std::io::Result<Stream> {
+    let s = sock
+        .to_str()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "sock path utf-8"))?;
+    Stream::connect(endpoint_name(s)?)
+}
 
 fn short_sock(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now()
@@ -42,7 +52,7 @@ fn server_authenticates_and_serves_the_contract() {
     let bearer = "b".repeat(64);
     spawn_server(&sock, &bearer);
 
-    let stream = UnixStream::connect(&sock).expect("connect");
+    let stream = connect(&sock).expect("connect");
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
 
@@ -79,14 +89,14 @@ fn a_silent_connection_does_not_wedge_the_control_surface() {
     spawn_server(&sock, &bearer);
 
     // Attacker opens a connection and sends NOTHING (held open for the whole test).
-    let _silent = UnixStream::connect(&sock).expect("attacker connects");
+    let _silent = connect(&sock).expect("attacker connects");
 
     // A legitimate client must still complete the handshake well under a second. A bounded read
     // timeout makes the buggy (serial, head-of-line-blocking) case fail cleanly instead of hanging.
     let start = std::time::Instant::now();
-    let stream = UnixStream::connect(&sock).expect("victim connects");
+    let stream = connect(&sock).expect("victim connects");
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .set_recv_timeout(Some(std::time::Duration::from_secs(3)))
         .unwrap();
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
@@ -113,7 +123,7 @@ fn an_over_long_handshake_line_is_rejected_not_grown_unbounded() {
     let bearer = "b".repeat(64);
     spawn_server(&sock, &bearer);
 
-    let stream = UnixStream::connect(&sock).expect("connect");
+    let stream = connect(&sock).expect("connect");
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
     // Just over MAX_LINE (64 KiB) with no newline → the server caps the read and drops the connection.
@@ -146,7 +156,7 @@ fn a_wrong_bearer_is_rejected_with_no_ready() {
     let _ = std::fs::remove_file(&sock);
     spawn_server(&sock, &"b".repeat(64));
 
-    let stream = UnixStream::connect(&sock).expect("connect");
+    let stream = connect(&sock).expect("connect");
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
     writeln!(w, "{{\"token\":\"{}\"}}", "w".repeat(64)).unwrap();
