@@ -34,7 +34,10 @@ fn libp2p_config_zeroizes_secret_on_drop() {
 
     // Sanity: the secret is actually present before drop.
     let before = unsafe { ptr::read(secret_ptr) };
-    assert_eq!(before, sentinel, "test setup: secret should be present before drop");
+    assert_eq!(
+        before, sentinel,
+        "test setup: secret should be present before drop"
+    );
 
     // Run `Drop::drop` in place. ManuallyDrop does not free the stack storage afterwards.
     unsafe { ManuallyDrop::drop(&mut cfg) };

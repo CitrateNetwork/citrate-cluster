@@ -170,10 +170,16 @@ fn sync_admitted_from_wire_reflects_connected_and_preserves_the_invariant() {
     s.transport_mut().dial(C);
     // Before syncing, admission is a lie: A is meshed but not admitted.
     assert!(!s.membership().is_admitted(A));
-    assert!(!s.wire_tracks_admitted(), "connected ⊄ admitted before the sync");
+    assert!(
+        !s.wire_tracks_admitted(),
+        "connected ⊄ admitted before the sync"
+    );
 
     s.sync_admitted_from_wire();
-    assert!(s.membership().is_admitted(A), "allowed, connected peer is admitted");
+    assert!(
+        s.membership().is_admitted(A),
+        "allowed, connected peer is admitted"
+    );
     assert!(
         !s.membership().is_admitted(C),
         "a non-allowed peer is NEVER admitted, even if the wire connected it"

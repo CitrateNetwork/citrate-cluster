@@ -45,8 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::read_to_string(&seed_file)
                 .map_err(|e| format!("reading seed file {seed_file}: {e}"))?,
         );
-        let seed_bytes =
-            Zeroizing::new(hex::decode(seed_hex.trim()).map_err(|_| "seed must be hex".to_string())?);
+        let seed_bytes = Zeroizing::new(
+            hex::decode(seed_hex.trim()).map_err(|_| "seed must be hex".to_string())?,
+        );
         let mut secret: [u8; 32] = <[u8; 32]>::try_from(seed_bytes.as_slice())
             .map_err(|_| "seed must be 32 bytes".to_string())?;
         let (address, peer_id) = Libp2pTransport::identity_from_secret(secret)?;
@@ -77,8 +78,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Pre-validate the libp2p env here so the lazy per-group factory's `expect` never fires on
         // bad config — fail closed at startup with a clear message instead. (Also stats the 0600 seed
         // file per CL-B-007.)
-        let cfg =
-            Libp2pTransport::config_from_env().map_err(|e| format!("libp2p transport config: {e}"))?;
+        let cfg = Libp2pTransport::config_from_env()
+            .map_err(|e| format!("libp2p transport config: {e}"))?;
         let group = cfg.group_id.clone();
         // CL-B-007: the identity the daemon advertises (SELF_ADDR) must equal the identity derived
         // from the seed file, or the node reports one address locally while presenting another on the
