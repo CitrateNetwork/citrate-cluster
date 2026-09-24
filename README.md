@@ -147,6 +147,4 @@ All config is via env (secrets as file paths only):
 
 ## License
 
-Source-available (BUSL-1.1) — free for personal/non-commercial use;
-commercial/hosted use requires a membership license. This is not an open-source
-license.
+Source-available under the Business Source License 1.1 (see [`LICENSE`](LICENSE)); converts to Apache-2.0 on the Change Date stated in the license. This is the commercial application-layer / core tier of Citrate's open-core model; the infrastructure tier is Apache-2.0. Licensor: Citrate Inc.
