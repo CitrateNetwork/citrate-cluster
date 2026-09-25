@@ -87,7 +87,7 @@ fn drop_peer_takes_a_peer_offline_without_deauthorizing() {
 fn share_file_ok_and_poll_is_empty_on_a_single_node() {
     let mut d = daemon();
     d.join("g1").unwrap();
-    assert!(d.share_file("g1", "bafycid").is_ok());
+    assert!(d.share_file("g1", &cid_n(0)).is_ok());
     assert!(d.poll("g1").is_empty(), "no peers → no messages");
     assert!(d.share_file("missing", "cid").is_err());
     assert_eq!(d.status("missing"), (0, 0, Vec::<String>::new()));
@@ -196,17 +196,18 @@ fn in_process_transport_delivers_and_drains() {
 fn share_file_adds_the_cid_to_status_shared_files() {
     let mut d = daemon();
     d.join("g1").unwrap();
-    d.share_file("g1", "bafyself").unwrap();
+    let own = cid_n(1);
+    d.share_file("g1", &own).unwrap();
     let (_, _, shared) = d.status("g1");
     assert_eq!(
         shared,
-        vec!["bafyself".to_string()],
+        vec![own.clone()],
         "this node's own co-pin is in the shared set"
     );
     // Idempotent: re-announcing the same CID does not duplicate it.
-    d.share_file("g1", "bafyself").unwrap();
+    d.share_file("g1", &own).unwrap();
     let (_, _, shared) = d.status("g1");
-    assert_eq!(shared, vec!["bafyself".to_string()]);
+    assert_eq!(shared, vec![own]);
 }
 
 #[test]
@@ -220,16 +221,18 @@ fn a_received_co_pin_shows_up_in_the_next_status_shared_files() {
         .get_mut("g1")
         .expect("group exists after join")
         .transport_mut()
-        .deliver(A, "bafypeer");
+        .deliver(A, &cid_n(2));
     let (_, _, shared) = d.status("g1");
     assert!(
-        shared.contains(&"bafypeer".to_string()),
+        shared.contains(&cid_n(2)),
         "a received co-pin is accumulated into the shared set on status()"
     );
     // Mixed set stays sorted+deduped across own announcements and received co-pins.
-    d.share_file("g1", "aaaaself").unwrap();
+    // (a CIDv0 `Qm…` sorts before every base32 `b…` CIDv1.)
+    let own_v0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG".to_string();
+    d.share_file("g1", &own_v0).unwrap();
     let (_, _, shared) = d.status("g1");
-    assert_eq!(shared, vec!["aaaaself".to_string(), "bafypeer".to_string()]);
+    assert_eq!(shared, vec![own_v0, cid_n(2)]);
 }
 
 // CL-S3 regression: SetRoster must AUTHORIZE every role-gated roster peer in the transport (else the
@@ -323,4 +326,158 @@ fn pba_l6b_005_set_roster_deauthorizes_every_removed_address_even_if_never_admit
     d.set_roster("g", &roster(&[(B, "guest"), (C, "admin")]))
         .unwrap();
     assert!(DISCONNECTED.with(|d| d.borrow().is_empty()));
+}
+
+/// A syntactically valid, distinct CIDv1 (base32) for index `i` (body chars from the base32 alphabet).
+fn cid_n(i: usize) -> String {
+    const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut s = String::from("bafkrei");
+    let mut n = i;
+    for _ in 0..52 {
+        s.push(B32[n % 32] as char);
+        n /= 32;
+    }
+    s
+}
+
+// PBA-L6b-020: the co-pinned shared set is bounded per group. A peer (or, pre-L6b-005, a revoked
+// ex-member) flooding distinct CIDs must not grow the daemon's memory or the Status line without
+// bound.
+#[test]
+fn pba_l6b_020_received_co_pins_are_capped_per_group() {
+    let mut d = daemon();
+    d.join("g1").unwrap();
+    let flood = 5_000usize;
+    {
+        let t = d.groups.get_mut("g1").expect("group").transport_mut();
+        for i in 0..flood {
+            t.deliver(A, &cid_n(i));
+        }
+    }
+    let _ = d.poll("g1");
+    let (_, _, shared) = d.status("g1");
+    assert!(
+        shared.len() <= 4096,
+        "PBA-L6b-020: shared set must be capped, got {}",
+        shared.len()
+    );
+    assert!(
+        !shared.is_empty(),
+        "the cap keeps the first CIDs, it does not drop everything"
+    );
+}
+
+#[test]
+fn pba_l6b_020_share_file_is_refused_once_the_set_is_full() {
+    let mut d = daemon();
+    d.join("g1").unwrap();
+    for i in 0..4096 {
+        d.share_file("g1", &cid_n(i)).unwrap();
+    }
+    assert!(
+        d.share_file("g1", &cid_n(4096)).is_err(),
+        "PBA-L6b-020: a new CID past the cap is refused with an explicit error"
+    );
+    assert!(
+        d.share_file("g1", &cid_n(7)).is_ok(),
+        "re-announcing a CID already in the set is still fine at the cap"
+    );
+}
+
+// PBA-L6b-037: only well-formed CIDs cross the daemon boundary (from the local client or the mesh).
+#[test]
+fn pba_l6b_037_share_file_rejects_a_non_cid() {
+    let mut d = daemon();
+    d.join("g1").unwrap();
+    for bad in [
+        "",
+        "../../etc/passwd",
+        "evil cid",
+        "bafy/../x",
+        "cid",
+        "BAFKREIUPPERCASE",
+    ] {
+        assert!(
+            d.share_file("g1", bad).is_err(),
+            "PBA-L6b-037: {bad:?} must be refused"
+        );
+    }
+    let (_, _, shared) = d.status("g1");
+    assert!(shared.is_empty());
+}
+
+#[test]
+fn pba_l6b_037_a_received_non_cid_never_reaches_status_or_poll() {
+    let mut d = daemon();
+    d.join("g1").unwrap();
+    {
+        let t = d.groups.get_mut("g1").expect("group").transport_mut();
+        t.deliver(A, "../../../home/user/.ssh/id_rsa");
+        t.deliver(A, &"b".repeat(60_000));
+        t.deliver(A, &cid_n(1));
+    }
+    let polled = d.poll("g1");
+    assert_eq!(
+        polled.iter().map(|m| m.data.clone()).collect::<Vec<_>>(),
+        vec![cid_n(1)],
+        "PBA-L6b-037: only the well-formed CID is surfaced by Poll"
+    );
+    let (_, _, shared) = d.status("g1");
+    assert_eq!(shared, vec![cid_n(1)]);
+}
+
+// PBA-L6b-020: the shared set is paged over IPC, with its total size, and a page is clamped.
+#[test]
+fn pba_l6b_020_shared_files_are_paged_over_ipc() {
+    let mut d = daemon();
+    d.join("g1").unwrap();
+    for i in 0..1500 {
+        d.share_file("g1", &cid_n(i)).unwrap();
+    }
+    let (_, _, all) = d.status("g1");
+    let page = |d: &mut ClusterDaemon<InProcessTransport>, offset, limit| match handle_request(
+        d,
+        Request::SharedFiles {
+            group: "g1".into(),
+            offset,
+            limit,
+        },
+    ) {
+        Response::SharedFiles {
+            files,
+            offset: o,
+            total,
+        } => {
+            assert_eq!(o, offset);
+            (files, total)
+        }
+        other => panic!("expected SharedFiles, got {other:?}"),
+    };
+    let (p0, total) = page(&mut d, 0, None);
+    assert_eq!(total, 1500);
+    assert_eq!(
+        p0.len(),
+        MAX_SHARED_FILES_PAGE,
+        "the default page is the page maximum"
+    );
+    assert_eq!(p0[..], all[..MAX_SHARED_FILES_PAGE]);
+    let (p1, _) = page(&mut d, MAX_SHARED_FILES_PAGE, Some(10_000));
+    assert_eq!(p1[..], all[MAX_SHARED_FILES_PAGE..], "the rest, clamped");
+    let (p2, _) = page(&mut d, 10, Some(5));
+    assert_eq!(p2[..], all[10..15]);
+    let (p3, _) = page(&mut d, 1500, Some(5));
+    assert!(p3.is_empty());
+    // Unknown group: empty, total 0.
+    assert_eq!(d.shared_files_page("nope", 0, 10), (Vec::new(), 0));
+    // The JSON contract: offset/limit are optional.
+    let req: Request =
+        serde_json::from_str(r#"{"op":"sharedFiles","group":"g1"}"#).expect("parses");
+    assert!(matches!(
+        req,
+        Request::SharedFiles {
+            offset: 0,
+            limit: None,
+            ..
+        }
+    ));
 }

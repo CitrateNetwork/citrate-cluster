@@ -86,6 +86,11 @@ const MAX_ESTABLISHED_INCOMING: u32 = 64;
 const MAX_PENDING_INCOMING: u32 = 16;
 const MAX_ESTABLISHED_PER_PEER: u32 = 2;
 
+/// PBA-L6b-020: the most accepted mesh messages buffered between two daemon drains. The daemon is
+/// request-driven (it drains on Status/Poll), so an authorized-but-flooding peer could otherwise grow
+/// the inbox without bound between polls. Past the cap new messages are dropped.
+pub const MAX_INBOX: usize = 1024;
+
 /// PBA-L6b-006: how long a connection may stay un-identified before it is dropped. `identify` runs
 /// immediately after the Noise/yamux upgrade, so a legitimate peer is identified in well under a
 /// second; a peer that never speaks `identify` is reaped instead of being left meshed forever.
@@ -458,7 +463,7 @@ fn build_swarm(
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
             gossipsub
                 .with_peer_score(admission_score_params(), admission_score_thresholds())
-                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
             let identify = identify::Behaviour::new(identify::Config::new(
                 IDENTIFY_PROTOCOL.into(),
                 key.public(),
@@ -636,29 +641,27 @@ async fn swarm_loop(
                         if !authorized {
                             continue;
                         }
-                        if let Ok(data) = String::from_utf8(message.data) {
+                        if let Some(data) = accept_payload(message.data) {
                             if let Ok(mut s) = shared.lock() {
-                                s.inbox.push(MeshMessage { from: address, data });
+                                push_inbox(&mut s.inbox, MeshMessage { from: address, data });
                             }
                         }
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                        // Only forget the peer once its LAST connection is gone (up to
-                        // MAX_ESTABLISHED_PER_PEER may be open).
-                        if num_established == 0 {
-                            unidentified.remove(&peer_id);
-                            // Lift the blacklist so a later reconnect is handled afresh (gossipsub
-                            // ignores a blacklisted peer's new connection entirely, which would stop
-                            // us announcing our subscription to it once it is admitted). The
-                            // reconnect is re-gated at ConnectionEstablished.
-                            swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .remove_blacklisted_peer(&peer_id);
-                            if let Some(address) = peer_addr.remove(&peer_id) {
-                                if let Ok(mut s) = shared.lock() {
-                                    s.connected.remove(&address);
-                                }
+                    // Only forget the peer once its LAST connection is gone (up to
+                    // MAX_ESTABLISHED_PER_PEER may be open).
+                    SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                        unidentified.remove(&peer_id);
+                        // Lift the blacklist so a later reconnect is handled afresh (gossipsub
+                        // ignores a blacklisted peer's new connection entirely, which would stop us
+                        // announcing our subscription to it once it is admitted). The reconnect is
+                        // re-gated at ConnectionEstablished.
+                        swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .remove_blacklisted_peer(&peer_id);
+                        if let Some(address) = peer_addr.remove(&peer_id) {
+                            if let Ok(mut s) = shared.lock() {
+                                s.connected.remove(&address);
                             }
                         }
                     }
@@ -667,6 +670,23 @@ async fn swarm_loop(
             }
         }
     }
+}
+
+/// PBA-L6b-037: a gossip payload is accepted only if it is UTF-8 AND a well-formed CID (the only
+/// thing the co-pin mesh carries). Anything else is dropped at the wire.
+fn accept_payload(data: Vec<u8>) -> Option<String> {
+    String::from_utf8(data)
+        .ok()
+        .filter(|s| cluster_core::is_valid_cid(s))
+}
+
+/// PBA-L6b-020: append to the inbox unless it already holds [`MAX_INBOX`] messages.
+fn push_inbox(inbox: &mut Vec<MeshMessage>, m: MeshMessage) -> bool {
+    if inbox.len() >= MAX_INBOX {
+        return false;
+    }
+    inbox.push(m);
+    true
 }
 
 /// Derive an EVM address (canonical: lowercase, no `0x`, 40 hex) from a libp2p **secp256k1** public

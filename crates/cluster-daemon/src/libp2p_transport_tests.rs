@@ -15,6 +15,9 @@ fn test_secret(seed: u8) -> [u8; 32] {
     b
 }
 
+/// A well-formed CIDv1 (the mesh only relays CIDs — PBA-L6b-037).
+const SHARED_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
 fn loopback() -> Multiaddr {
     "/ip4/127.0.0.1/tcp/0".parse().expect("loopback multiaddr")
 }
@@ -84,7 +87,7 @@ fn two_nodes_form_mesh_and_exchange_a_group_message() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut got = None;
     while Instant::now() < deadline {
-        a.publish(&addr_a, "bafycidshared");
+        a.publish(&addr_a, SHARED_CID);
         sleep(Duration::from_millis(250));
         let msgs = b.drain();
         if let Some(m) = msgs.into_iter().next() {
@@ -94,7 +97,7 @@ fn two_nodes_form_mesh_and_exchange_a_group_message() {
     }
 
     let msg = got.expect("B received A's gossipsub message within the deadline");
-    assert_eq!(msg.data, "bafycidshared");
+    assert_eq!(msg.data, SHARED_CID);
     assert_eq!(
         msg.from, addr_a,
         "sender resolved from the authenticated secp256k1 key"
@@ -204,4 +207,47 @@ fn an_unauthorized_inbound_peer_is_refused_on_the_wire() {
         !host.connected().contains(&stranger_addr),
         "the unauthorized peer is dropped, never counted connected"
     );
+}
+
+// PBA-L6b-020: the wire inbox is bounded between daemon drains.
+#[test]
+fn pba_l6b_020_inbox_is_capped() {
+    let mut inbox = Vec::new();
+    let m = |i: usize| MeshMessage {
+        from: "aa".repeat(20),
+        data: format!("m{i}"),
+    };
+    for i in 0..MAX_INBOX {
+        assert!(
+            push_inbox(&mut inbox, m(i)),
+            "below the cap every message is kept"
+        );
+    }
+    assert!(
+        !push_inbox(&mut inbox, m(MAX_INBOX)),
+        "at the cap a new message is dropped"
+    );
+    assert_eq!(inbox.len(), MAX_INBOX);
+    assert_eq!(
+        inbox[MAX_INBOX - 1].data,
+        format!("m{}", MAX_INBOX - 1),
+        "oldest kept, newest dropped"
+    );
+}
+
+// PBA-L6b-037: only UTF-8, well-formed CIDs are accepted off the wire.
+#[test]
+fn pba_l6b_037_only_cid_payloads_are_accepted_off_the_wire() {
+    let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    assert_eq!(
+        accept_payload(cid.as_bytes().to_vec()).as_deref(),
+        Some(cid)
+    );
+    assert_eq!(accept_payload(b"../../etc/passwd".to_vec()), None);
+    assert_eq!(
+        accept_payload(vec![0xff, 0xfe, 0x00]),
+        None,
+        "non-UTF-8 is dropped"
+    );
+    assert_eq!(accept_payload(b"evil-cid".to_vec()), None);
 }

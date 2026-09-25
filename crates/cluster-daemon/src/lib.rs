@@ -19,6 +19,14 @@ pub mod transport;
 use ipc::{MeshMessage, PeerView};
 use transport::MeshTransport;
 
+/// PBA-L6b-020: the most CIDs a group's co-pinned shared set holds. Past this, newly received co-pins
+/// are dropped and a local `ShareFile` of a new CID is refused, so a flooding peer cannot grow the
+/// daemon's memory (or the `Status` line) without bound. `SharedFiles` pages through the set.
+pub const MAX_SHARED_FILES: usize = 4096;
+
+/// PBA-L6b-020: the largest page `SharedFiles` returns in one response.
+pub const MAX_SHARED_FILES_PAGE: usize = 1024;
+
 /// CL-B-007: refuse to read a secret file (the seed, the bearer) unless it is `0600` and owned by the
 /// daemon's own uid. A packaging bug, a `umask 0` service manager, or a client that writes the file
 /// before `chmod`-ing it otherwise leaves the 32-byte cluster identity secret (or the bearer)
@@ -125,11 +133,20 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         let Some(s) = self.groups.get_mut(group) else {
             return Vec::new();
         };
-        let messages = s.transport_mut().drain();
+        // PBA-L6b-037: only well-formed CIDs cross into the client (whatever the transport let in).
+        let messages: Vec<MeshMessage> = s
+            .transport_mut()
+            .drain()
+            .into_iter()
+            .filter(|m| cluster_core::is_valid_cid(&m.data))
+            .collect();
         if !messages.is_empty() {
             let set = self.shared_files.entry(group.to_string()).or_default();
             for m in &messages {
-                set.insert(m.data.clone());
+                // PBA-L6b-020: bounded — past the cap a new CID is dropped (known ones are no-ops).
+                if set.len() < MAX_SHARED_FILES {
+                    set.insert(m.data.clone());
+                }
             }
         }
         messages
@@ -230,20 +247,47 @@ impl<T: MeshTransport> ClusterDaemon<T> {
             .collect()
     }
 
-    /// Announce a shared file (co-pin) to the group over the mesh. Unknown group → `Err`.
+    /// Announce a shared file (co-pin) to the group over the mesh. Unknown group, a malformed CID
+    /// (PBA-L6b-037) or a full shared set (PBA-L6b-020) → `Err`, and nothing is published.
     pub fn share_file(&mut self, group: &str, cid: &str) -> Result<(), String> {
         let from = self.self_address.clone();
-        match self.groups.get_mut(group) {
-            Some(s) => {
-                s.transport_mut().publish(&from, cid);
-                self.shared_files
-                    .entry(group.to_string())
-                    .or_default()
-                    .insert(cid.to_string());
-                Ok(())
-            }
-            None => Err(format!("not in group {group}")),
+        let Some(s) = self.groups.get_mut(group) else {
+            return Err(format!("not in group {group}"));
+        };
+        if !cluster_core::is_valid_cid(cid) {
+            return Err("not a well-formed CID".to_string());
         }
+        let set = self.shared_files.entry(group.to_string()).or_default();
+        if !set.contains(cid) && set.len() >= MAX_SHARED_FILES {
+            return Err(format!(
+                "shared file set for {group} is full ({MAX_SHARED_FILES} CIDs)"
+            ));
+        }
+        s.transport_mut().publish(&from, cid);
+        set.insert(cid.to_string());
+        Ok(())
+    }
+
+    /// PBA-L6b-020: one page of a group's co-pinned shared set (sorted), plus the set's total size,
+    /// so a client can walk a large set without one unbounded response. `limit` is clamped to
+    /// [`MAX_SHARED_FILES_PAGE`]. Drains newly-received co-pins first, like `status()`.
+    pub fn shared_files_page(
+        &mut self,
+        group: &str,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<String>, usize) {
+        self.drain_into_shared(group);
+        let Some(set) = self.shared_files.get(group) else {
+            return (Vec::new(), 0);
+        };
+        let page = set
+            .iter()
+            .skip(offset)
+            .take(limit.min(MAX_SHARED_FILES_PAGE))
+            .cloned()
+            .collect();
+        (page, set.len())
     }
 
     /// Drain received mesh messages for a group, accumulating each into the group's co-pinned set

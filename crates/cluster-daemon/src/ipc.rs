@@ -34,6 +34,15 @@ pub enum Request {
     ShareFile { group: String, cid: String },
     /// Drain received gossipsub messages for the group (e.g. peers' co-pin announcements).
     Poll { group: String },
+    /// PBA-L6b-020: one page of the group's co-pinned shared set (sorted). `limit` defaults to and is
+    /// clamped at the daemon's page maximum.
+    SharedFiles {
+        group: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
 }
 
 /// One peer in a status/peers response.
@@ -80,6 +89,12 @@ pub enum Response {
     Messages {
         messages: Vec<MeshMessage>,
     },
+    /// PBA-L6b-020: a page of the co-pinned shared set and the set's total size.
+    SharedFiles {
+        files: Vec<String>,
+        offset: usize,
+        total: usize,
+    },
     Error {
         message: String,
     },
@@ -118,5 +133,21 @@ pub fn handle_request<T: MeshTransport>(daemon: &mut ClusterDaemon<T>, req: Requ
         Request::Poll { group } => Response::Messages {
             messages: daemon.poll(&group),
         },
+        Request::SharedFiles {
+            group,
+            offset,
+            limit,
+        } => {
+            let (files, total) = daemon.shared_files_page(
+                &group,
+                offset,
+                limit.unwrap_or(crate::MAX_SHARED_FILES_PAGE),
+            );
+            Response::SharedFiles {
+                files,
+                offset,
+                total,
+            }
+        }
     }
 }

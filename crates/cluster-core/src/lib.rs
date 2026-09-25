@@ -45,6 +45,36 @@ pub fn canonical_address(raw: &str) -> Option<String> {
     }
 }
 
+/// Longest CID string the cluster relays (PBA-L6b-037). A CIDv1 over a 64-byte digest in base32 is
+/// ~113 chars; anything longer is not a content id the mesh has any business carrying.
+pub const MAX_CID_LEN: usize = 128;
+
+/// Whether `s` is a well-formed IPFS content id, as the co-pin mesh relays it (PBA-L6b-037). Pure
+/// grammar, no multihash decoding:
+///
+/// * **CIDv0** — `Qm` + 44 base58btc chars (a sha2-256 dag-pb multihash), 46 chars total.
+/// * **CIDv1, base32** (multibase `b`, the IPFS default) — lowercase RFC 4648 alphabet `[a-z2-7]`,
+///   at least 7 body chars (version + codec + multihash code + length ≥ 4 bytes), at most
+///   [`MAX_CID_LEN`] total, and a leading version byte of exactly `0x01` (body starts `a` then one of
+///   `e f g h`).
+///
+/// Everything else — paths, whitespace, upper case, other multibases, oversize payloads — is
+/// refused, so nothing but a content id ever reaches the client (citrate-core) from the mesh.
+pub fn is_valid_cid(s: &str) -> bool {
+    const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let b = s.as_bytes();
+    if b.len() == 46 && b.starts_with(b"Qm") {
+        return b[2..].iter().all(|c| B58.contains(c));
+    }
+    if b.len() < 8 || b.len() > MAX_CID_LEN || b[0] != b'b' {
+        return false;
+    }
+    let body = &b[1..];
+    body.iter().all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+        && body[0] == b'a'
+        && matches!(body[1], b'e'..=b'h')
+}
+
 /// Derive the cluster's allowed-peer set from an **address-only** roster (the S4.1 derivation):
 /// canonical, de-duplicated, sorted, non-addresses dropped — so two nodes compute a byte-identical
 /// mesh membership from the same roster (the input to per-peer Noise-identity minting).
