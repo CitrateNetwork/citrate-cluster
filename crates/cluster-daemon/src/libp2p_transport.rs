@@ -284,13 +284,10 @@ impl Libp2pTransport {
             .ok_or("CITRATE_CLUSTER_SEED_FILE is required for the libp2p transport")?;
         // CL-B-007: the seed file holds the 32-byte cluster identity secret — refuse to read it
         // unless it is 0600 and owned by us (fail closed on a world/group-readable key file).
-        crate::assert_secure_file(&seed_file)?;
         // CL-B-001: the hex string and the decoded raw-secret bytes both carry key material — wrap
         // them in `Zeroizing` so they are wiped from the heap when they drop, not left un-scrubbed.
-        let seed_hex_owned = Zeroizing::new(
-            std::fs::read_to_string(&seed_file)
-                .map_err(|e| format!("reading seed file {seed_file}: {e}"))?,
-        );
+        // R2 (PBA-L6b-022 class): one no-follow open, checks on the fd, capped read.
+        let seed_hex_owned = crate::read_secret_file(&seed_file)?;
         let seed_hex = seed_hex_owned.trim();
         if seed_hex.is_empty() {
             return Err("seed file is empty (fail closed)".into());
@@ -450,11 +447,7 @@ fn build_swarm(
             // subscribed to the topic — including one that never ran `identify` and so was never
             // admitted — received every publication. Publications now go to the mesh (plus
             // above-threshold peers), and admission gates mesh membership through the peer score.
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .flood_publish(false)
-                .build()
+            let gossipsub_config = gossipsub_config()
                 .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
             let mut gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
@@ -486,6 +479,16 @@ fn build_swarm(
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_TIMEOUT))
         .build();
     Ok(swarm)
+}
+
+/// The group topic's gossipsub config: signed + strict validation, and (PBA-L6b-006) NO flood
+/// publishing — publications go to mesh peers, and admission gates the mesh through the peer score.
+fn gossipsub_config() -> Result<gossipsub::Config, gossipsub::ConfigBuilderError> {
+    gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .flood_publish(false)
+        .build()
 }
 
 /// PBA-L6b-006: peer-score parameters used purely as an admission gate. Only the application score

@@ -251,3 +251,38 @@ fn pba_l6b_037_only_cid_payloads_are_accepted_off_the_wire() {
     );
     assert_eq!(accept_payload(b"evil-cid".to_vec()), None);
 }
+
+// PBA-L6b-006 config invariants (kill-tests for the swarm-loop hand mutants M1/M7/M8): no flood
+// publishing, and an unadmitted peer's score sits strictly below the gossip AND publish thresholds
+// (sent nothing, never grafted) but strictly above the graylist (its SUBSCRIBE is still recorded,
+// so a legitimate peer admitted a moment later — identify can lag the subscription — is served).
+#[test]
+fn pba_l6b_006_admission_gate_config_invariants() {
+    let cfg = gossipsub_config().expect("gossipsub config builds");
+    assert!(!cfg.flood_publish(), "flood publishing must be off");
+    let params = admission_score_params();
+    let th = admission_score_thresholds();
+    let unadmitted = UNADMITTED_APP_SCORE * params.app_specific_weight;
+    assert!(
+        unadmitted < th.gossip_threshold,
+        "gated peers get no IHAVE/IWANT"
+    );
+    assert!(
+        unadmitted < th.publish_threshold,
+        "gated peers get no publications"
+    );
+    assert!(unadmitted < 0.0, "gated peers are never grafted");
+    assert!(
+        unadmitted > th.graylist_threshold,
+        "gated peers' subscriptions are still processed"
+    );
+    assert_eq!(
+        params.ip_colocation_factor_weight, 0.0,
+        "a LAN of members is not penalised"
+    );
+    assert!(params.validate().is_ok() && th.validate().is_ok());
+    assert!(
+        IDENTIFY_TIMEOUT <= Duration::from_secs(10),
+        "un-identified peers are reaped promptly"
+    );
+}
