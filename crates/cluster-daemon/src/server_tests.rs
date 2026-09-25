@@ -16,7 +16,19 @@ fn connect(sock: &Path) -> std::io::Result<Stream> {
     let s = sock
         .to_str()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "sock path utf-8"))?;
-    Stream::connect(endpoint_name(s)?)
+    // The socket FILE appears at bind(), a moment before listen(); `spawn_server` only waits for the
+    // file, so on a loaded machine the first connect can land in that gap (ECONNREFUSED). Retry that
+    // one error briefly — every other error, and a refusal that persists, still fails the test.
+    let mut tries = 0;
+    loop {
+        match Stream::connect(endpoint_name(s)?) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn short_sock(tag: &str) -> PathBuf {
