@@ -214,6 +214,7 @@ fn bind_hardened(socket_path: &Path) -> std::io::Result<Listener> {
             "socket path is not valid UTF-8",
         )
     })?;
+    check_socket_dir(socket_path)?;
     let name = endpoint_name(sock_str)?;
     let old = unsafe { libc::umask(0o177) };
     // interprocess binds the same underlying Unix-domain socket as `UnixListener::bind`, honouring the
@@ -223,6 +224,49 @@ fn bind_hardened(socket_path: &Path) -> std::io::Result<Listener> {
     let listener = res?;
     harden(socket_path)?;
     Ok(listener)
+}
+
+/// PBA-L6b-038: refuse to bind the control socket in a directory another local user could write to
+/// — they could unlink/replace the socket path with their own listener (harvesting the bearer from
+/// the next client) or pre-create it. The parent must be owned by us (or root) and must not be
+/// group/world-writable unless it carries the sticky bit (as `/tmp` does — there only the owner may
+/// unlink or rename our socket). Fails closed with an explicit reason.
+#[cfg(unix)]
+fn check_socket_dir(socket_path: &Path) -> std::io::Result<()> {
+    check_socket_dir_for(socket_path, unsafe { libc::geteuid() })
+}
+
+/// [`check_socket_dir`] against an explicit effective uid (unit-testable ownership branch).
+#[cfg(unix)]
+fn check_socket_dir_for(socket_path: &Path, euid: libc::uid_t) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = match socket_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let md = std::fs::metadata(parent)?;
+    let mode = md.mode();
+    if md.uid() != euid && md.uid() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket dir {} is owned by uid {} (not us or root) — fail closed",
+                parent.display(),
+                md.uid()
+            ),
+        ));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket dir {} is group/world-writable without the sticky bit (mode {:04o}) — fail closed",
+                parent.display(),
+                mode & 0o7777
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Bind the control socket on Windows: a named pipe endpoint derived from the socket path's basename
@@ -252,8 +296,9 @@ fn raw_fd(stream: &Stream) -> std::os::unix::io::RawFd {
 }
 
 /// Whether the connecting peer runs as the daemon's own effective uid (CL-B-006). If the peer uid
-/// cannot be determined, defer to the bearer (do not break the legitimate path) — this is defence in
-/// depth, not a replacement for the token. Linux uses `SO_PEERCRED`; other unixes use `getpeereid`.
+/// cannot be determined the connection is refused (PBA-L6b-038 — fail closed). This is defence in
+/// depth; the bearer remains the authorization gate. Linux uses `SO_PEERCRED`; other unixes use
+/// `getpeereid`.
 #[cfg(target_os = "linux")]
 fn peer_uid_matches(stream: &Stream) -> bool {
     let mut cred = libc::ucred {
@@ -271,10 +316,7 @@ fn peer_uid_matches(stream: &Stream) -> bool {
             &mut len,
         )
     };
-    if rc != 0 {
-        return true;
-    }
-    cred.uid == unsafe { libc::geteuid() }
+    peer_uid_decision(rc, cred.uid, unsafe { libc::geteuid() })
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -282,10 +324,17 @@ fn peer_uid_matches(stream: &Stream) -> bool {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
     let rc = unsafe { libc::getpeereid(raw_fd(stream), &mut uid, &mut gid) };
-    if rc != 0 {
-        return true;
-    }
-    uid == unsafe { libc::geteuid() }
+    peer_uid_decision(rc, uid, unsafe { libc::geteuid() })
+}
+
+/// The peer-uid gate as a pure decision over the credential syscall's return code (`rc`), the peer's
+/// uid and our effective uid.
+#[cfg(unix)]
+///
+/// PBA-L6b-038: if the credentials cannot be read the connection is REFUSED (fail closed). A peer
+/// check that waves an unidentifiable caller through is not a check.
+fn peer_uid_decision(rc: libc::c_int, peer_uid: libc::uid_t, euid: libc::uid_t) -> bool {
+    rc == 0 && peer_uid == euid
 }
 
 /// Windows has no `getpeereid`/`SO_PEERCRED` equivalent for named pipes here — the named pipe's ACL

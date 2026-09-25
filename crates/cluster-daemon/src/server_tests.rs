@@ -179,3 +179,109 @@ fn a_wrong_bearer_is_rejected_with_no_ready() {
         "got: {line}"
     );
 }
+
+/// Run `serve` on `sock` in a thread and report whether it RETURNED an error within `wait` (a healthy
+/// `serve` never returns — it blocks accepting).
+#[cfg(unix)]
+fn serve_error_within(sock: &Path, wait: std::time::Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock_owned = sock.to_path_buf();
+    std::thread::spawn(move || {
+        let daemon = ClusterDaemon::new(
+            "0x1111111111111111111111111111111111111111",
+            InProcessTransport::new,
+        );
+        let r = serve(daemon, &sock_owned, &"b".repeat(64));
+        let _ = tx.send(r.err().map(|e| e.to_string()));
+    });
+    rx.recv_timeout(wait).ok().flatten()
+}
+
+// PBA-L6b-038: the control socket must not be bound in a directory another local user can write to
+// (they could swap the socket path for their own listener or pre-create it). A group/world-writable
+// parent without the sticky bit is refused, fail closed.
+#[cfg(unix)]
+#[test]
+fn pba_l6b_038_a_world_writable_socket_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PathBuf::from(format!("/tmp/ctzc-ww-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = serve_error_within(&dir.join("c.sock"), std::time::Duration::from_secs(2));
+    assert!(
+        !dir.join("c.sock").exists(),
+        "PBA-L6b-038: nothing may be bound in a world-writable dir"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = err.expect("PBA-L6b-038: serve must refuse a world-writable socket dir");
+    assert!(err.contains("writable"), "explicit reason: {err}");
+}
+
+// No-regression: a private (0700) dir and a sticky world-writable dir (/tmp) are both accepted.
+#[cfg(unix)]
+#[test]
+fn pba_l6b_038_private_and_sticky_socket_dirs_are_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PathBuf::from(format!("/tmp/ctzc-pv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        serve_error_within(&dir.join("c.sock"), std::time::Duration::from_millis(500)),
+        None,
+        "a private socket dir is served"
+    );
+    assert!(dir.join("c.sock").exists());
+    let sticky = short_sock("sticky");
+    let _ = std::fs::remove_file(&sticky);
+    assert_eq!(
+        serve_error_within(&sticky, std::time::Duration::from_millis(500)),
+        None,
+        "a root-owned sticky dir (/tmp) is served"
+    );
+}
+
+// PBA-L6b-038: if the peer's credentials cannot be read, the connection is refused (fail closed),
+// not waved through to the bearer check.
+#[cfg(unix)]
+#[test]
+fn pba_l6b_038_peer_uid_check_fails_closed_on_error() {
+    let me = unsafe { libc::geteuid() };
+    assert!(
+        peer_uid_decision(0, me, me),
+        "same uid, credentials read → allowed"
+    );
+    assert!(
+        !peer_uid_decision(0, me.wrapping_add(1), me),
+        "different uid → refused"
+    );
+    assert!(
+        !peer_uid_decision(-1, me, me),
+        "PBA-L6b-038: credentials unreadable → refused (fail closed)"
+    );
+}
+
+// PBA-L6b-038: a socket dir owned by another (non-root) user is refused; ours and root's are not.
+#[cfg(unix)]
+#[test]
+fn pba_l6b_038_a_socket_dir_owned_by_another_user_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PathBuf::from(format!("/tmp/ctzc-own-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let me = unsafe { libc::geteuid() };
+    let sock = dir.join("c.sock");
+    assert!(
+        check_socket_dir_for(&sock, me).is_ok(),
+        "our own private dir is fine"
+    );
+    let other = if me == 0 { 4242 } else { me + 1 };
+    let err =
+        check_socket_dir_for(&sock, other).expect_err("a dir owned by someone else is refused");
+    assert!(err.to_string().contains("owned by uid"), "{err}");
+    // Root-owned (e.g. `/`, not group/world-writable) is accepted for any caller.
+    assert!(check_socket_dir_for(Path::new("/c.sock"), other).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
