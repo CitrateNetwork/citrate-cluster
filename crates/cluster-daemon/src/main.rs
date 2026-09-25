@@ -22,7 +22,6 @@
 //!   CITRATE_CLUSTER_BOOTSTRAP    optional comma-separated peer multiaddrs to dial on startup
 
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 
 use cluster_daemon::libp2p_transport::Libp2pTransport;
@@ -41,10 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let seed_file = required("CITRATE_CLUSTER_SEED_FILE")?;
         // CL-B-001: wipe the hex string, decoded bytes, and the `[u8; 32]` copy handed to
         // `identity_from_secret` (which takes it by value/`Copy`, so the local retains a live copy).
-        let seed_hex = Zeroizing::new(
-            fs::read_to_string(&seed_file)
-                .map_err(|e| format!("reading seed file {seed_file}: {e}"))?,
-        );
+        let seed_hex = cluster_daemon::read_secret_file(&seed_file)?;
         let seed_bytes = Zeroizing::new(
             hex::decode(seed_hex.trim()).map_err(|_| "seed must be hex".to_string())?,
         );
@@ -59,9 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = PathBuf::from(required("CITRATE_CLUSTER_SOCKET")?);
     let bearer_file = required("CITRATE_CLUSTER_BEARER_FILE")?;
     // CL-B-007: the bearer file is a secret — refuse to read it unless it is 0600 and owned by us.
-    cluster_daemon::assert_secure_file(&bearer_file)?;
-    let bearer = fs::read_to_string(&bearer_file)
-        .map_err(|e| format!("reading bearer file {bearer_file}: {e}"))?
+    // R2 (PBA-L6b-022 class): one no-follow open, checks on the fd, capped read.
+    let bearer = cluster_daemon::read_secret_file(&bearer_file)?
         .trim()
         .to_string();
     if bearer.is_empty() {

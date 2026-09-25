@@ -237,3 +237,43 @@ fn the_wire_never_contains_an_unadmitted_peer_across_a_sequence() {
     assert!(s.transport().connected().is_empty());
     assert!(s.wire_tracks_admitted() && s.membership().admitted().is_empty());
 }
+
+// PBA-L6b-037: the CID grammar the mesh relays.
+#[test]
+fn pba_l6b_037_is_valid_cid_accepts_real_cids() {
+    for ok in [
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+        "bafkqaaa",
+    ] {
+        assert!(is_valid_cid(ok), "{ok} is a valid CID");
+    }
+}
+
+#[test]
+fn pba_l6b_037_is_valid_cid_refuses_everything_else() {
+    let long = format!("bafkrei{}", "a".repeat(MAX_CID_LEN));
+    let exact = format!("bafkrei{}", "a".repeat(MAX_CID_LEN - 7));
+    assert!(is_valid_cid(&exact), "exactly MAX_CID_LEN is allowed");
+    for bad in [
+        "",
+        "b",
+        "bafkqaa", // 6 body chars: too short
+        "../../etc/passwd",
+        "bafy/../x",
+        "bafy cid with spaces",
+        "BAFYBEIGDYRZT5SFP7UDM7HU76UH7Y26NF3EFUYLQABF3OCLGTQY55FBZDI", // upper case
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzd1", // '1' not base32
+        "baaaaaaaaa",                                                  // version byte 0x00
+        "bqfybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi", // version byte != 1
+        "bajybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi", // version byte 0x02
+        "zdj7WWeQ43G6JJvLWQWZpyHuAMq6uYWRjkBXFad11vE2LHhQ7",           // base58 CIDv1 (not relayed)
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbd",               // CIDv0 one char short
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbd0",              // '0' not base58
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdGx",             // CIDv0 one char long
+    ] {
+        assert!(!is_valid_cid(bad), "{bad:?} must be refused");
+    }
+    assert!(!is_valid_cid(&long), "over MAX_CID_LEN is refused");
+}

@@ -19,6 +19,14 @@ pub mod transport;
 use ipc::{MeshMessage, PeerView};
 use transport::MeshTransport;
 
+/// PBA-L6b-020: the most CIDs a group's co-pinned shared set holds. Past this, newly received co-pins
+/// are dropped and a local `ShareFile` of a new CID is refused, so a flooding peer cannot grow the
+/// daemon's memory (or the `Status` line) without bound. `SharedFiles` pages through the set.
+pub const MAX_SHARED_FILES: usize = 4096;
+
+/// PBA-L6b-020: the largest page `SharedFiles` returns in one response.
+pub const MAX_SHARED_FILES_PAGE: usize = 1024;
+
 /// CL-B-007: refuse to read a secret file (the seed, the bearer) unless it is `0600` and owned by the
 /// daemon's own uid. A packaging bug, a `umask 0` service manager, or a client that writes the file
 /// before `chmod`-ing it otherwise leaves the 32-byte cluster identity secret (or the bearer)
@@ -47,6 +55,68 @@ pub fn assert_secure_file(path: &str) -> Result<(), String> {
 #[cfg(not(unix))]
 pub fn assert_secure_file(_path: &str) -> Result<(), String> {
     Ok(())
+}
+
+/// Largest secret file (hex seed / bearer) the daemon will read. Both are well under 1 KiB.
+pub const MAX_SECRET_FILE: u64 = 4096;
+
+/// Read a secret file (the seed, the bearer) safely — the PBA-L6b-022 class applied here (R2 variant
+/// sweep). `assert_secure_file` + `read_to_string` was stat-then-read by PATH: a symlink swapped in
+/// after the stat, a FIFO (blocks forever / unbounded) or a huge file were all read. This opens once
+/// with `O_NOFOLLOW | O_NONBLOCK`, checks the OPEN fd (regular file, 0600-or-stricter, owned by us)
+/// and reads at most [`MAX_SECRET_FILE`] bytes. The contents are wiped on drop. Fails closed.
+#[cfg(unix)]
+pub fn read_secret_file(path: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("open secret file {path}: {e} (symlinks are refused)"))?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("stat secret file {path}: {e}"))?;
+    if !md.file_type().is_file() {
+        return Err(format!(
+            "secret file {path} is not a regular file — fail closed"
+        ));
+    }
+    let mode = md.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "secret file {path} is group/world-accessible (mode {mode:04o}); it must be 0600 — fail closed"
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if md.uid() != euid {
+        return Err(format!(
+            "secret file {path} is owned by uid {} not the daemon's uid {euid} — fail closed",
+            md.uid()
+        ));
+    }
+    read_capped(f, path)
+}
+
+/// Non-unix: no mode/owner/symlink semantics to check; the size cap still applies.
+#[cfg(not(unix))]
+pub fn read_secret_file(path: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open secret file {path}: {e}"))?;
+    read_capped(f, path)
+}
+
+fn read_capped(f: std::fs::File, path: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    use std::io::Read;
+    let mut buf = zeroize::Zeroizing::new(Vec::new());
+    f.take(MAX_SECRET_FILE + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("reading secret file {path}: {e}"))?;
+    if buf.len() as u64 > MAX_SECRET_FILE {
+        return Err(format!(
+            "secret file {path} exceeds {MAX_SECRET_FILE} bytes — fail closed"
+        ));
+    }
+    let s = std::str::from_utf8(&buf).map_err(|_| format!("secret file {path} is not UTF-8"))?;
+    Ok(zeroize::Zeroizing::new(s.to_string()))
 }
 
 /// The daemon: this node's address + a session per group.
@@ -125,11 +195,20 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         let Some(s) = self.groups.get_mut(group) else {
             return Vec::new();
         };
-        let messages = s.transport_mut().drain();
+        // PBA-L6b-037: only well-formed CIDs cross into the client (whatever the transport let in).
+        let messages: Vec<MeshMessage> = s
+            .transport_mut()
+            .drain()
+            .into_iter()
+            .filter(|m| cluster_core::is_valid_cid(&m.data))
+            .collect();
         if !messages.is_empty() {
             let set = self.shared_files.entry(group.to_string()).or_default();
             for m in &messages {
-                set.insert(m.data.clone());
+                // PBA-L6b-020: bounded — past the cap a new CID is dropped (known ones are no-ops).
+                if set.len() < MAX_SHARED_FILES {
+                    set.insert(m.data.clone());
+                }
             }
         }
         messages
@@ -147,6 +226,12 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// the transport so its inbound connection is admitted at the identify handshake (the "authorize
     /// before connect" ordering — without this the mesh drops every peer as unauthorized). Authorize
     /// opens no socket and is a no-op for the single-node in-process transport. Returns the evicted.
+    ///
+    /// PBA-L6b-005: `reconcile` only evicts peers in `admitted`, and on the libp2p path a peer that is
+    /// offline at revoke time is never in `admitted` — so it used to stay in the transport's
+    /// authorized set and could reconnect, publish and read the topic. We therefore diff the allowed
+    /// set before/after and DE-AUTHORIZE (transport `disconnect`) every address that left it, online
+    /// or not, keeping the transport's authorized set equal to `allowed` (offboarding guarantee).
     pub fn set_roster(
         &mut self,
         group: &str,
@@ -154,8 +239,13 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     ) -> Result<Vec<String>, String> {
         self.ensure_group_allowed(group)?;
         let session = self.ensure_session(group);
+        let before: BTreeSet<String> = session.membership().allowed().into_iter().collect();
         let evicted = session.reconcile(roster);
         let allowed = session.membership().allowed();
+        let after: BTreeSet<&String> = allowed.iter().collect();
+        for removed in before.iter().filter(|a| !after.contains(a)) {
+            session.transport_mut().disconnect(removed);
+        }
         for addr in &allowed {
             session.transport_mut().authorize(addr);
         }
@@ -219,20 +309,47 @@ impl<T: MeshTransport> ClusterDaemon<T> {
             .collect()
     }
 
-    /// Announce a shared file (co-pin) to the group over the mesh. Unknown group → `Err`.
+    /// Announce a shared file (co-pin) to the group over the mesh. Unknown group, a malformed CID
+    /// (PBA-L6b-037) or a full shared set (PBA-L6b-020) → `Err`, and nothing is published.
     pub fn share_file(&mut self, group: &str, cid: &str) -> Result<(), String> {
         let from = self.self_address.clone();
-        match self.groups.get_mut(group) {
-            Some(s) => {
-                s.transport_mut().publish(&from, cid);
-                self.shared_files
-                    .entry(group.to_string())
-                    .or_default()
-                    .insert(cid.to_string());
-                Ok(())
-            }
-            None => Err(format!("not in group {group}")),
+        let Some(s) = self.groups.get_mut(group) else {
+            return Err(format!("not in group {group}"));
+        };
+        if !cluster_core::is_valid_cid(cid) {
+            return Err("not a well-formed CID".to_string());
         }
+        let set = self.shared_files.entry(group.to_string()).or_default();
+        if !set.contains(cid) && set.len() >= MAX_SHARED_FILES {
+            return Err(format!(
+                "shared file set for {group} is full ({MAX_SHARED_FILES} CIDs)"
+            ));
+        }
+        s.transport_mut().publish(&from, cid);
+        set.insert(cid.to_string());
+        Ok(())
+    }
+
+    /// PBA-L6b-020: one page of a group's co-pinned shared set (sorted), plus the set's total size,
+    /// so a client can walk a large set without one unbounded response. `limit` is clamped to
+    /// [`MAX_SHARED_FILES_PAGE`]. Drains newly-received co-pins first, like `status()`.
+    pub fn shared_files_page(
+        &mut self,
+        group: &str,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<String>, usize) {
+        self.drain_into_shared(group);
+        let Some(set) = self.shared_files.get(group) else {
+            return (Vec::new(), 0);
+        };
+        let page = set
+            .iter()
+            .skip(offset)
+            .take(limit.min(MAX_SHARED_FILES_PAGE))
+            .cloned()
+            .collect();
+        (page, set.len())
     }
 
     /// Drain received mesh messages for a group, accumulating each into the group's co-pinned set

@@ -54,7 +54,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -85,6 +85,31 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ESTABLISHED_INCOMING: u32 = 64;
 const MAX_PENDING_INCOMING: u32 = 16;
 const MAX_ESTABLISHED_PER_PEER: u32 = 2;
+
+/// PBA-L6b-020: the most accepted mesh messages buffered between two daemon drains. The daemon is
+/// request-driven (it drains on Status/Poll), so an authorized-but-flooding peer could otherwise grow
+/// the inbox without bound between polls. Past the cap new messages are dropped.
+pub const MAX_INBOX: usize = 1024;
+
+/// PBA-L6b-006: how long a connection may stay un-identified before it is dropped. `identify` runs
+/// immediately after the Noise/yamux upgrade, so a legitimate peer is identified in well under a
+/// second; a peer that never speaks `identify` is reaped instead of being left meshed forever.
+const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the swarm task sweeps for connections past [`IDENTIFY_TIMEOUT`].
+const IDENTIFY_SWEEP: Duration = Duration::from_millis(500);
+
+/// PBA-L6b-006: the gossipsub application score given to every peer that is not (yet) admitted.
+/// It sits below the gossip and publish thresholds (so the peer is never sent a publication, a
+/// forward, IHAVE gossip or an IWANT reply, and is never grafted into the mesh) but ABOVE the
+/// graylist threshold, so the peer's own SUBSCRIBE is still recorded — otherwise a legitimate peer
+/// admitted a moment later at `identify` would never be sent anything.
+const UNADMITTED_APP_SCORE: f64 = -1_000.0;
+/// Score thresholds paired with [`UNADMITTED_APP_SCORE`] (the gossipsub defaults, except a graylist
+/// low enough that an unadmitted peer's subscription is still processed).
+const GOSSIP_THRESHOLD: f64 = -10.0;
+const PUBLISH_THRESHOLD: f64 = -50.0;
+const GRAYLIST_THRESHOLD: f64 = -10_000.0;
 
 /// Errors from constructing / listening the transport. The [`ClusterTransport`] surface itself is
 /// infallible (the daemon drives it with `()` returns); all fallible work is in [`Libp2pTransport::new`].
@@ -259,13 +284,10 @@ impl Libp2pTransport {
             .ok_or("CITRATE_CLUSTER_SEED_FILE is required for the libp2p transport")?;
         // CL-B-007: the seed file holds the 32-byte cluster identity secret — refuse to read it
         // unless it is 0600 and owned by us (fail closed on a world/group-readable key file).
-        crate::assert_secure_file(&seed_file)?;
         // CL-B-001: the hex string and the decoded raw-secret bytes both carry key material — wrap
         // them in `Zeroizing` so they are wiped from the heap when they drop, not left un-scrubbed.
-        let seed_hex_owned = Zeroizing::new(
-            std::fs::read_to_string(&seed_file)
-                .map_err(|e| format!("reading seed file {seed_file}: {e}"))?,
-        );
+        // R2 (PBA-L6b-022 class): one no-follow open, checks on the fd, capped read.
+        let seed_hex_owned = crate::read_secret_file(&seed_file)?;
         let seed_hex = seed_hex_owned.trim();
         if seed_hex.is_empty() {
             return Err("seed file is empty (fail closed)".into());
@@ -421,16 +443,20 @@ fn build_swarm(
         )
         .map_err(|e| TransportError::Build(format!("tcp: {e}")))?
         .with_behaviour(|key| {
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .build()
+            // PBA-L6b-006: never flood-publish. With the default `flood_publish(true)` every peer
+            // subscribed to the topic — including one that never ran `identify` and so was never
+            // admitted — received every publication. Publications now go to the mesh (plus
+            // above-threshold peers), and admission gates mesh membership through the peer score.
+            let gossipsub_config = gossipsub_config()
                 .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
-            let gossipsub = gossipsub::Behaviour::new(
+            let mut gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+            gossipsub
+                .with_peer_score(admission_score_params(), admission_score_thresholds())
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
             let identify = identify::Behaviour::new(identify::Config::new(
                 IDENTIFY_PROTOCOL.into(),
                 key.public(),
@@ -455,6 +481,52 @@ fn build_swarm(
     Ok(swarm)
 }
 
+/// The group topic's gossipsub config: signed + strict validation, and (PBA-L6b-006) NO flood
+/// publishing — publications go to mesh peers, and admission gates the mesh through the peer score.
+fn gossipsub_config() -> Result<gossipsub::Config, gossipsub::ConfigBuilderError> {
+    gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .flood_publish(false)
+        .build()
+}
+
+/// PBA-L6b-006: peer-score parameters used purely as an admission gate. Only the application score
+/// carries weight (1.0, so a peer's score IS its app score); IP colocation is disabled so a LAN of
+/// legitimate members behind one NAT is never penalised. No topic scoring is configured.
+fn admission_score_params() -> gossipsub::PeerScoreParams {
+    gossipsub::PeerScoreParams {
+        app_specific_weight: 1.0,
+        ip_colocation_factor_weight: 0.0,
+        ..Default::default()
+    }
+}
+
+fn admission_score_thresholds() -> gossipsub::PeerScoreThresholds {
+    gossipsub::PeerScoreThresholds {
+        gossip_threshold: GOSSIP_THRESHOLD,
+        publish_threshold: PUBLISH_THRESHOLD,
+        graylist_threshold: GRAYLIST_THRESHOLD,
+        ..Default::default()
+    }
+}
+
+/// PBA-L6b-006: shut a (not-yet- or no-longer-) admitted peer out of the group topic: its messages
+/// are rejected (blacklist) and it is scored below the gossip/publish thresholds, so it is sent
+/// nothing and never grafted into the mesh.
+fn gate_peer(swarm: &mut Swarm<ClusterBehaviour>, peer: &PeerId) {
+    let gs = &mut swarm.behaviour_mut().gossipsub;
+    gs.blacklist_peer(peer);
+    gs.set_application_score(peer, UNADMITTED_APP_SCORE);
+}
+
+/// PBA-L6b-006: admit a peer to the group topic after `identify` resolved it to an authorized address.
+fn ungate_peer(swarm: &mut Swarm<ClusterBehaviour>, peer: &PeerId) {
+    let gs = &mut swarm.behaviour_mut().gossipsub;
+    gs.remove_blacklisted_peer(peer);
+    gs.set_application_score(peer, 0.0);
+}
+
 /// The swarm driver: processes commands from the sync surface and swarm events, enforcing admission
 /// on the wire.
 async fn swarm_loop(
@@ -465,10 +537,27 @@ async fn swarm_loop(
 ) {
     // PeerId → resolved member address, for authenticated senders we have identified.
     let mut peer_addr: HashMap<PeerId, String> = HashMap::new();
+    // PBA-L6b-006: connections established but not yet identified, with when they were first seen.
+    let mut unidentified: HashMap<PeerId, Instant> = HashMap::new();
+    let mut sweep = tokio::time::interval(IDENTIFY_SWEEP);
     let topic_hash = gossipsub::IdentTopic::new(topic_name.clone()).hash();
 
     loop {
         tokio::select! {
+            _ = sweep.tick() => {
+                // PBA-L6b-006: drop every connection that has not identified within the window.
+                let now = Instant::now();
+                let expired: Vec<PeerId> = unidentified
+                    .iter()
+                    .filter(|(_, since)| now.duration_since(**since) >= IDENTIFY_TIMEOUT)
+                    .map(|(p, _)| *p)
+                    .collect();
+                for p in expired {
+                    unidentified.remove(&p);
+                    gate_peer(&mut swarm, &p);
+                    let _ = swarm.disconnect_peer_id(p);
+                }
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return; }; // surface dropped → shut down
                 match cmd {
@@ -487,6 +576,7 @@ async fn swarm_loop(
                             .map(|(p, _)| *p)
                             .collect();
                         for p in targets {
+                            gate_peer(&mut swarm, &p);
                             let _ = swarm.disconnect_peer_id(p);
                         }
                     }
@@ -500,9 +590,18 @@ async fn swarm_loop(
                     // Admission on the wire: `identify` carries the peer's authenticated secp256k1
                     // public key. Resolve its address, double-check the key hashes to the connection's
                     // PeerId, and admit-or-drop against the authorized set.
+                    // PBA-L6b-006: every new connection starts GATED — no gossip in or out — until
+                    // `identify` admits it; the sweep above drops it if it never identifies.
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        if !peer_addr.contains_key(&peer_id) {
+                            gate_peer(&mut swarm, &peer_id);
+                            unidentified.entry(peer_id).or_insert_with(Instant::now);
+                        }
+                    }
                     SwarmEvent::Behaviour(ClusterBehaviourEvent::Identify(
                         identify::Event::Received { peer_id, info, .. },
                     )) => {
+                        unidentified.remove(&peer_id);
                         if info.public_key.to_peer_id() != peer_id {
                             // Key does not match the Noise-authenticated PeerId — refuse.
                             let _ = swarm.disconnect_peer_id(peer_id);
@@ -518,11 +617,13 @@ async fn swarm_loop(
                             .unwrap_or(false);
                         if authorized {
                             peer_addr.insert(peer_id, address.clone());
+                            ungate_peer(&mut swarm, &peer_id);
                             if let Ok(mut s) = shared.lock() {
                                 s.connected.insert(address);
                             }
                         } else {
-                            // Not in the group's allowed set → drop the connection.
+                            // Not in the group's allowed set → keep it gated and drop the connection.
+                            gate_peer(&mut swarm, &peer_id);
                             let _ = swarm.disconnect_peer_id(peer_id);
                         }
                     }
@@ -543,13 +644,24 @@ async fn swarm_loop(
                         if !authorized {
                             continue;
                         }
-                        if let Ok(data) = String::from_utf8(message.data) {
+                        if let Some(data) = accept_payload(message.data) {
                             if let Ok(mut s) = shared.lock() {
-                                s.inbox.push(MeshMessage { from: address, data });
+                                push_inbox(&mut s.inbox, MeshMessage { from: address, data });
                             }
                         }
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    // Only forget the peer once its LAST connection is gone (up to
+                    // MAX_ESTABLISHED_PER_PEER may be open).
+                    SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                        unidentified.remove(&peer_id);
+                        // Lift the blacklist so a later reconnect is handled afresh (gossipsub
+                        // ignores a blacklisted peer's new connection entirely, which would stop us
+                        // announcing our subscription to it once it is admitted). The reconnect is
+                        // re-gated at ConnectionEstablished.
+                        swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .remove_blacklisted_peer(&peer_id);
                         if let Some(address) = peer_addr.remove(&peer_id) {
                             if let Ok(mut s) = shared.lock() {
                                 s.connected.remove(&address);
@@ -561,6 +673,23 @@ async fn swarm_loop(
             }
         }
     }
+}
+
+/// PBA-L6b-037: a gossip payload is accepted only if it is UTF-8 AND a well-formed CID (the only
+/// thing the co-pin mesh carries). Anything else is dropped at the wire.
+fn accept_payload(data: Vec<u8>) -> Option<String> {
+    String::from_utf8(data)
+        .ok()
+        .filter(|s| cluster_core::is_valid_cid(s))
+}
+
+/// PBA-L6b-020: append to the inbox unless it already holds [`MAX_INBOX`] messages.
+fn push_inbox(inbox: &mut Vec<MeshMessage>, m: MeshMessage) -> bool {
+    if inbox.len() >= MAX_INBOX {
+        return false;
+    }
+    inbox.push(m);
+    true
 }
 
 /// Derive an EVM address (canonical: lowercase, no `0x`, 40 hex) from a libp2p **secp256k1** public
