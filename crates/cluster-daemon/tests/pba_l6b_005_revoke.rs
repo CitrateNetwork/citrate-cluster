@@ -213,3 +213,77 @@ fn pba_l6b_005_member_removed_while_offline_is_refused_on_reconnect() {
         "the offboarded member is not a peer"
     );
 }
+
+// Variant: revoke while the member is CONNECTED and meshed, with no Status/Peers call in between
+// (so `admitted` was never synced from the wire). It must be dropped and must stop receiving the
+// group's gossip, while the control member keeps receiving it.
+const G_LIVE: &str = "pba-l6b-005-live";
+static LIVE_LISTEN: Mutex<Option<Multiaddr>> = Mutex::new(None);
+fn live_host() -> Libp2pTransport {
+    let t = transport(0x31, G_LIVE);
+    *LIVE_LISTEN.lock().unwrap() = Some(listen(&t));
+    t
+}
+
+#[test]
+fn pba_l6b_005_member_revoked_while_connected_is_dropped_and_stops_receiving() {
+    let host_addr = host_address(0x31);
+    let mut d = ClusterDaemon::new_single_group(host_addr.clone(), live_host, G_LIVE);
+    let mut ex = transport(0x32, G_LIVE);
+    let mut keep = transport(0x33, G_LIVE);
+    let ex_addr = ex.self_address().to_string();
+    let keep_addr = keep.self_address().to_string();
+    d.set_roster(
+        G_LIVE,
+        &[
+            (ex_addr.clone(), "member".into()),
+            (keep_addr.clone(), "member".into()),
+        ],
+    )
+    .unwrap();
+    let host_listen = LIVE_LISTEN.lock().unwrap().clone().expect("host listen");
+    ex.authorize(&host_addr);
+    keep.authorize(&host_addr);
+    ex.dial_multiaddr(host_listen.clone()).expect("dial");
+    keep.dial_multiaddr(host_listen).expect("dial");
+
+    // Both are meshed and receive the host's co-pins.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (mut ex_got, mut keep_got) = (false, false);
+    while Instant::now() < deadline && !(ex_got && keep_got) {
+        d.share_file(G_LIVE, CID_CONTROL).unwrap();
+        sleep(Duration::from_millis(250));
+        ex_got |= !ex.drain().is_empty();
+        keep_got |= !keep.drain().is_empty();
+    }
+    assert!(ex_got && keep_got, "precondition: both members meshed");
+
+    // Revoke `ex` (no status/peers call first).
+    d.set_roster(G_LIVE, &[(keep_addr.clone(), "member".into())])
+        .unwrap();
+    sleep(Duration::from_millis(500));
+    let _ = ex.drain();
+    let _ = keep.drain();
+
+    let t0 = Instant::now();
+    let (mut ex_after, mut keep_after) = (0usize, 0usize);
+    while t0.elapsed() < Duration::from_secs(4) {
+        d.share_file(G_LIVE, CID_CONTROL).unwrap();
+        ex.publish(&ex_addr, CID_REVOKED);
+        sleep(Duration::from_millis(250));
+        ex_after += ex.drain().len();
+        keep_after += keep.drain().len();
+    }
+    assert!(
+        keep_after > 0,
+        "control: the remaining member still receives"
+    );
+    assert_eq!(
+        ex_after, 0,
+        "PBA-L6b-005: a revoked member receives nothing"
+    );
+    assert!(
+        !d.poll(G_LIVE).iter().any(|m| m.from == ex_addr),
+        "PBA-L6b-005: a revoked member's gossip is never accepted"
+    );
+}
