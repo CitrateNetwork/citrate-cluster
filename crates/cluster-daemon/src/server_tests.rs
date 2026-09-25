@@ -281,6 +281,8 @@ fn pba_l6b_038_a_socket_dir_owned_by_another_user_is_refused() {
     let err =
         check_socket_dir_for(&sock, other).expect_err("a dir owned by someone else is refused");
     assert!(err.to_string().contains("owned by uid"), "{err}");
+    // A bare relative socket name is checked against the current dir (ours in tests), not "".
+    assert!(check_socket_dir_for(Path::new("c.sock"), me).is_ok(), "relative name → cwd");
     // Root-owned (e.g. `/`, not group/world-writable) is accepted for any caller.
     assert!(check_socket_dir_for(Path::new("/c.sock"), other).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
