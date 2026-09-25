@@ -147,6 +147,12 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// the transport so its inbound connection is admitted at the identify handshake (the "authorize
     /// before connect" ordering — without this the mesh drops every peer as unauthorized). Authorize
     /// opens no socket and is a no-op for the single-node in-process transport. Returns the evicted.
+    ///
+    /// PBA-L6b-005: `reconcile` only evicts peers in `admitted`, and on the libp2p path a peer that is
+    /// offline at revoke time is never in `admitted` — so it used to stay in the transport's
+    /// authorized set and could reconnect, publish and read the topic. We therefore diff the allowed
+    /// set before/after and DE-AUTHORIZE (transport `disconnect`) every address that left it, online
+    /// or not, keeping the transport's authorized set equal to `allowed` (offboarding guarantee).
     pub fn set_roster(
         &mut self,
         group: &str,
@@ -154,8 +160,13 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     ) -> Result<Vec<String>, String> {
         self.ensure_group_allowed(group)?;
         let session = self.ensure_session(group);
+        let before: BTreeSet<String> = session.membership().allowed().into_iter().collect();
         let evicted = session.reconcile(roster);
         let allowed = session.membership().allowed();
+        let after: BTreeSet<&String> = allowed.iter().collect();
+        for removed in before.iter().filter(|a| !after.contains(a)) {
+            session.transport_mut().disconnect(removed);
+        }
         for addr in &allowed {
             session.transport_mut().authorize(addr);
         }

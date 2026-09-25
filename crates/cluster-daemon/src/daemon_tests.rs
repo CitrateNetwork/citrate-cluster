@@ -238,6 +238,7 @@ fn a_received_co_pin_shows_up_in_the_next_status_shared_files() {
 
 thread_local! {
     static AUTHORIZED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DISCONNECTED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct RecordingTransport;
@@ -248,7 +249,9 @@ impl RecordingTransport {
 }
 impl cluster_core::ClusterTransport for RecordingTransport {
     fn dial(&mut self, _peer: &str) {}
-    fn disconnect(&mut self, _peer: &str) {}
+    fn disconnect(&mut self, peer: &str) {
+        DISCONNECTED.with(|d| d.borrow_mut().push(peer.to_string()));
+    }
     fn connected(&self) -> Vec<String> {
         Vec::new()
     }
@@ -284,4 +287,40 @@ fn set_roster_authorizes_every_role_gated_peer_not_guests() {
         !got.contains(&C.to_string()),
         "a guest is NOT authorized to mesh"
     );
+}
+
+// PBA-L6b-005: a roster change must DE-AUTHORIZE (transport `disconnect`) every address that left the
+// allowed set — including peers that were never admitted (offline at revoke time), which the
+// admitted-only `reconcile` eviction never reaches — and must leave still-allowed peers alone.
+#[test]
+fn pba_l6b_005_set_roster_deauthorizes_every_removed_address_even_if_never_admitted() {
+    AUTHORIZED.with(|a| a.borrow_mut().clear());
+    DISCONNECTED.with(|d| d.borrow_mut().clear());
+    let mut d = ClusterDaemon::new(SELF, RecordingTransport::new);
+    d.set_roster("g", &roster(&[(A, "member"), (B, "member"), (C, "admin")]))
+        .unwrap();
+    assert!(
+        DISCONNECTED.with(|d| d.borrow().is_empty()),
+        "adding peers de-authorizes nobody"
+    );
+    // A is offboarded, B is demoted to guest, C stays. None of them was ever admitted.
+    let evicted = d
+        .set_roster("g", &roster(&[(B, "guest"), (C, "admin")]))
+        .unwrap();
+    assert!(
+        evicted.is_empty(),
+        "nobody was admitted, so nobody is evicted"
+    );
+    let mut gone = DISCONNECTED.with(|d| d.borrow().clone());
+    gone.sort();
+    assert_eq!(
+        gone,
+        vec![A.to_string(), B.to_string()],
+        "every address removed from the allowed set is de-authorized on the transport, and only those"
+    );
+    // Re-applying the same roster is a no-op on the wire.
+    DISCONNECTED.with(|d| d.borrow_mut().clear());
+    d.set_roster("g", &roster(&[(B, "guest"), (C, "admin")]))
+        .unwrap();
+    assert!(DISCONNECTED.with(|d| d.borrow().is_empty()));
 }
