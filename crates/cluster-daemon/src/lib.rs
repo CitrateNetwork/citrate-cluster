@@ -57,6 +57,68 @@ pub fn assert_secure_file(_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Largest secret file (hex seed / bearer) the daemon will read. Both are well under 1 KiB.
+pub const MAX_SECRET_FILE: u64 = 4096;
+
+/// Read a secret file (the seed, the bearer) safely — the PBA-L6b-022 class applied here (R2 variant
+/// sweep). `assert_secure_file` + `read_to_string` was stat-then-read by PATH: a symlink swapped in
+/// after the stat, a FIFO (blocks forever / unbounded) or a huge file were all read. This opens once
+/// with `O_NOFOLLOW | O_NONBLOCK`, checks the OPEN fd (regular file, 0600-or-stricter, owned by us)
+/// and reads at most [`MAX_SECRET_FILE`] bytes. The contents are wiped on drop. Fails closed.
+#[cfg(unix)]
+pub fn read_secret_file(path: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("open secret file {path}: {e} (symlinks are refused)"))?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("stat secret file {path}: {e}"))?;
+    if !md.file_type().is_file() {
+        return Err(format!(
+            "secret file {path} is not a regular file — fail closed"
+        ));
+    }
+    let mode = md.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "secret file {path} is group/world-accessible (mode {mode:04o}); it must be 0600 — fail closed"
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if md.uid() != euid {
+        return Err(format!(
+            "secret file {path} is owned by uid {} not the daemon's uid {euid} — fail closed",
+            md.uid()
+        ));
+    }
+    read_capped(f, path)
+}
+
+/// Non-unix: no mode/owner/symlink semantics to check; the size cap still applies.
+#[cfg(not(unix))]
+pub fn read_secret_file(path: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open secret file {path}: {e}"))?;
+    read_capped(f, path)
+}
+
+fn read_capped(f: std::fs::File, path: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    use std::io::Read;
+    let mut buf = zeroize::Zeroizing::new(Vec::new());
+    f.take(MAX_SECRET_FILE + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("reading secret file {path}: {e}"))?;
+    if buf.len() as u64 > MAX_SECRET_FILE {
+        return Err(format!(
+            "secret file {path} exceeds {MAX_SECRET_FILE} bytes — fail closed"
+        ));
+    }
+    let s = std::str::from_utf8(&buf).map_err(|_| format!("secret file {path} is not UTF-8"))?;
+    Ok(zeroize::Zeroizing::new(s.to_string()))
+}
+
 /// The daemon: this node's address + a session per group.
 pub struct ClusterDaemon<T: MeshTransport> {
     /// This node's canonical member address (its comms/cluster identity — the gossipsub sender).

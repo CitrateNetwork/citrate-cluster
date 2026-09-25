@@ -481,3 +481,62 @@ fn pba_l6b_020_shared_files_are_paged_over_ipc() {
         }
     ));
 }
+
+// R2 variant of PBA-L6b-022 (stat-then-read by path): secret files are read through one no-follow
+// open with checks on the fd and a size cap.
+#[cfg(unix)]
+#[test]
+fn pba_r2_read_secret_file_refuses_symlinks_fifos_and_oversize() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pba-r2-secret-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    let good = p("good");
+    std::fs::write(&good, "deadbeef\n").unwrap();
+    std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        crate::read_secret_file(&good).unwrap().as_str(),
+        "deadbeef\n"
+    );
+
+    // A symlink to a perfectly good 0600 file is refused (the path could be swapped after a stat).
+    std::os::unix::fs::symlink(&good, p("link")).unwrap();
+    assert!(
+        crate::read_secret_file(&p("link")).is_err(),
+        "symlink refused"
+    );
+
+    // A FIFO is refused promptly (no blocking open, no unbounded read).
+    assert!(std::process::Command::new("mkfifo")
+        .arg(p("fifo"))
+        .status()
+        .unwrap()
+        .success());
+    std::fs::set_permissions(p("fifo"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(crate::read_secret_file(&p("fifo")).is_err(), "FIFO refused");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "without blocking"
+    );
+
+    // Oversize is refused; exactly the cap is fine.
+    let big = p("big");
+    std::fs::write(&big, vec![b'a'; crate::MAX_SECRET_FILE as usize + 1]).unwrap();
+    std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(crate::read_secret_file(&big).is_err(), "oversize refused");
+    std::fs::write(&big, vec![b'a'; crate::MAX_SECRET_FILE as usize]).unwrap();
+    assert!(
+        crate::read_secret_file(&big).is_ok(),
+        "exactly the cap is accepted"
+    );
+
+    // Mode is checked on the fd.
+    std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(
+        crate::read_secret_file(&good).is_err(),
+        "group-readable refused"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
