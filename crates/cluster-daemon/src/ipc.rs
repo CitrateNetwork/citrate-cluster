@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::devices::{DeviceLinkWire, MemberDevicesWire, RevocationWire};
 use crate::transport::MeshTransport;
 use crate::ClusterDaemon;
 
@@ -18,10 +19,22 @@ use crate::ClusterDaemon;
 pub enum Request {
     /// Set/update a group's roster `(address, role)`. Recomputes the role-gated allowed set and
     /// reconciles the mesh: newly-unauthorized peers are evicted (disconnected) in one step.
+    ///
+    /// HUP-S8.1: `devices` carries the group's signed DeviceLinks and `revocations` the members'
+    /// signed revocations (both optional on the wire, so an older client's `SetRoster` is unchanged).
+    /// The update is atomic: links are verified, revocations recorded (sticky), the member roster is
+    /// widened with each allowed member's linked devices, and the mesh is reconciled in ONE step, so
+    /// a revoked device is evicted by the same request that carries its revocation.
     SetRoster {
         group: String,
         roster: Vec<(String, String)>,
+        #[serde(default)]
+        devices: Vec<DeviceLinkWire>,
+        #[serde(default)]
+        revocations: Vec<RevocationWire>,
     },
+    /// HUP-S8.1: the roster with each member's linked devices listed under it.
+    Devices { group: String },
     /// This node joins the group's mesh (begins participating; the transport dials known peers).
     Join { group: String },
     /// This node leaves the group's mesh.
@@ -53,6 +66,10 @@ pub struct PeerView {
     pub address: String,
     /// Whether the peer is currently connected over the mesh transport.
     pub online: bool,
+    /// HUP-S8.1: when this peer is a linked device, the member it acts for. Absent for a member's
+    /// own identity (and on the wire from an older daemon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
 }
 
 /// One received message (a peer's gossipsub publication).
@@ -73,6 +90,14 @@ pub enum Response {
     /// The result of a reconcile: how many peers were evicted (newly unauthorized).
     Reconciled {
         evicted: Vec<String>,
+        /// HUP-S8.1: links/revocations that were not accepted, one short reason each (never a
+        /// signature). Omitted when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rejected: Vec<String>,
+    },
+    /// HUP-S8.1: members with their linked devices (answer to [`Request::Devices`]).
+    Devices {
+        members: Vec<MemberDevicesWire>,
     },
     /// Mesh status: `online` connected of `total` authorized, plus the group's co-pinned shared
     /// file set (`sharedFiles`, sorted+deduped CIDs — this node's announcements + peers' received
@@ -103,9 +128,17 @@ pub enum Response {
 /// Map one request onto the daemon. Never panics — every failure becomes an `Error` response.
 pub fn handle_request<T: MeshTransport>(daemon: &mut ClusterDaemon<T>, req: Request) -> Response {
     match req {
-        Request::SetRoster { group, roster } => match daemon.set_roster(&group, &roster) {
-            Ok(evicted) => Response::Reconciled { evicted },
+        Request::SetRoster {
+            group,
+            roster,
+            devices,
+            revocations,
+        } => match daemon.set_roster_with_devices(&group, &roster, &devices, &revocations) {
+            Ok((evicted, rejected)) => Response::Reconciled { evicted, rejected },
             Err(e) => Response::Error { message: e },
+        },
+        Request::Devices { group } => Response::Devices {
+            members: daemon.devices(&group),
         },
         Request::Join { group } => match daemon.join(&group) {
             Ok(()) => Response::Ok,

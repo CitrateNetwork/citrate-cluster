@@ -364,6 +364,7 @@ dependencies = [
  "futures",
  "hex",
  "interprocess",
+ "k256",
  "libc",
  "libp2p",
  "serde",
