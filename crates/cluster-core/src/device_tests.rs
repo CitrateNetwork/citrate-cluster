@@ -238,7 +238,8 @@ fn conflict_resolution_does_not_depend_on_order() {
 }
 
 #[test]
-fn two_devices_on_one_member_index_conflict() {
+fn the_index_is_a_display_ordinal_not_an_identity() {
+    // Two machines picked index 0 independently: both are still admitted (the key is the identity).
     let mut reg = DeviceRegistry::new();
     let rej = reg.update(
         &[
@@ -248,8 +249,9 @@ fn two_devices_on_one_member_index_conflict() {
         &[],
         &FakeVerifier,
     );
-    assert!(reg.links().is_empty());
-    assert_eq!(rej.len(), 2);
+    assert!(rej.is_empty(), "{rej:?}");
+    assert_eq!(reg.member_of(D1), Some(M1));
+    assert_eq!(reg.member_of(D2), Some(M1));
 }
 
 #[test]

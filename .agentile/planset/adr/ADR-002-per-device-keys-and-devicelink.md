@@ -34,8 +34,9 @@ a random device key per machine plus a wallet-signed DeviceLink.
    allowed member to the roster with the member's role. The existing `ClusterMembership` gate runs
    on that set, so `admitted ⊆ allowed` (ClusterAdmission) and the eviction-in-one-step behaviour are
    inherited, not re-implemented.
-4. **Conflicts admit nobody.** Two members claiming one device key, or two devices on one member
-   index, are both refused, so every node reaches the same answer regardless of order.
+4. **Conflicts admit nobody.** Two members claiming one device key are both refused, so every node
+   reaches the same answer regardless of order. The `index` is a display ordinal only: each machine
+   picks it locally, so two devices sharing an index are both admitted (the key is the identity).
 5. **Revocation is permanent per key.** A member-signed `DeviceRevocation` is recorded for good and
    evicts in the same `SetRoster`. A revoked key never returns; a re-added machine mints a new key.
    Only the member a device is linked to can revoke it.

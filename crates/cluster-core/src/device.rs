@@ -70,7 +70,8 @@ pub struct DeviceLink {
     pub device: String,
     /// The member's custody wallet address (canonical). Signs through the ceremony.
     pub wallet: String,
-    /// The member's index for this device (0 = first). Unique per member among active links.
+    /// A display ordinal for this device under its member (0 = first). Informational: the device
+    /// key is the identity, so two devices may carry the same index.
     pub index: u32,
     /// A short human label ("Studio Mac", "Linux box").
     pub label: String,
@@ -202,8 +203,8 @@ pub enum LinkRejection {
     Malformed { device: String },
     /// One of the three signatures does not recover to the address it should.
     BadSignature { device: String, which: &'static str },
-    /// Two different active links name the same device key (or the same member index). Neither is
-    /// admitted: every node must reach the same answer, so a conflict is never resolved by order.
+    /// Two links name the same device key for different members. Neither is admitted: every
+    /// node must reach the same answer, so a conflict is never resolved by order.
     Conflict { device: String },
     /// The device key was revoked by its member.
     Revoked { device: String },
@@ -344,21 +345,10 @@ impl DeviceRegistry {
             candidates.insert(device, newest);
         }
 
-        // 4. A member index names one device: two active devices on one (member, index) conflict.
-        let mut by_slot: BTreeMap<(String, u32), Vec<String>> = BTreeMap::new();
-        for (d, l) in &candidates {
-            by_slot
-                .entry((l.member.clone(), l.index))
-                .or_default()
-                .push(d.clone());
-        }
-        for devices in by_slot.values().filter(|ds| ds.len() > 1) {
-            for d in devices {
-                candidates.remove(d);
-                rejected.push(LinkRejection::Conflict { device: d.clone() });
-            }
-        }
-
+        // The member index is a display ordinal, not an identity: the device KEY is the identity, so
+        // two devices that happen to carry the same index are both admitted. (Device keys are random
+        // per machine and each machine picks its index locally, so enforcing index uniqueness would
+        // let two honest machines lock each other out.)
         self.links = candidates;
         rejected
     }
