@@ -29,6 +29,9 @@ libp2p = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 sha3 = { workspace = true }
+# HUP-S8.1: recover EIP-191 signers on DeviceLinks / revocations (verify only; the daemon never
+# signs a link). Already in the tree (resolved in Cargo.lock); declared directly for the verifier.
+k256 = { version = "0.13", features = ["ecdsa"] }
 # CL-B-001: zeroize the cluster identity secret + its hex/byte intermediates on drop.
 zeroize = { workspace = true }
 # CL-B-006/CL-B-007: umask the control socket at bind time, peer-uid check (getpeereid), and stat the

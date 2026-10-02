@@ -16,8 +16,12 @@
 //!
 //!   CITRATE_CLUSTER_LISTEN       listen multiaddr, e.g. /ip4/0.0.0.0/tcp/0 (selects libp2p)
 //!   CITRATE_CLUSTER_SEED_FILE    path to a 0600 file with the 32-byte hex secp256k1 secret — the
-//!                                Noise/peer identity is bound to this key (CL-2 = the wallet key).
-//!                                The secret NEVER crosses argv/env (they leak to `ps`), only a file.
+//!                                Noise/peer identity is bound to this key. HUP-S8.1: this is the
+//!                                DEVICE key (random per machine, linked to the member by a signed
+//!                                DeviceLink), so the PeerId is per device; a client without a
+//!                                link still passes its comms key (legacy single-device identity).
+//!                                Never the wallet key. The secret NEVER crosses argv/env (they
+//!                                leak to `ps`), only a file.
 //!   CITRATE_CLUSTER_GROUP        the group id == the gossipsub topic (one group per daemon in S1)
 //!   CITRATE_CLUSTER_BOOTSTRAP    optional comma-separated peer multiaddrs to dial on startup
 

@@ -17,6 +17,8 @@
 
 use std::collections::BTreeSet;
 
+pub mod device;
+
 /// The minimum group role admitted to a cluster (D-24): a **Member**. Guests/agents below this are
 /// in the group's conversation but not its compute/file mesh. Unknown roles rank lowest (fail closed).
 pub const MIN_CLUSTER_RANK: u8 = 2;

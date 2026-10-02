@@ -102,9 +102,11 @@ fn handle_request_round_trips_the_contract() {
         Request::SetRoster {
             group: "g1".into(),
             roster: roster(&[(A, "member")]),
+            devices: vec![],
+            revocations: vec![],
         },
     ) {
-        Response::Reconciled { evicted } => assert!(evicted.is_empty()),
+        Response::Reconciled { evicted, .. } => assert!(evicted.is_empty()),
         other => panic!("expected Reconciled, got {other:?}"),
     }
     match handle_request(&mut d, Request::Status { group: "g1".into() }) {

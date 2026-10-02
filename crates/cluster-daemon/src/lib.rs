@@ -9,13 +9,18 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use cluster_core::device::{device_roster, effective_roster, DeviceRegistry};
 use cluster_core::ClusterSession;
 
+pub mod devices;
 pub mod ipc;
 pub mod libp2p_transport;
 pub mod server;
 pub mod transport;
 
+use devices::{
+    describe_rejection, DeviceLinkWire, Eip191Verifier, MemberDevicesWire, RevocationWire,
+};
 use ipc::{MeshMessage, PeerView};
 use transport::MeshTransport;
 
@@ -138,6 +143,16 @@ pub struct ClusterDaemon<T: MeshTransport> {
     /// received from a peer over the mesh, sorted+deduped. The source of truth for
     /// `Status.sharedFiles`. Drained-into on `status()`/`poll()` (the daemon is request-driven).
     shared_files: HashMap<String, BTreeSet<String>>,
+    /// HUP-S8.1: per-group member roster (as the client sent it) and the verified device links +
+    /// sticky revocations. The session's allowed set is the EFFECTIVE roster derived from both.
+    device_state: HashMap<String, GroupDevices>,
+}
+
+/// HUP-S8.1: a group's member roster plus its verified device links (see [`devices`]).
+#[derive(Default)]
+struct GroupDevices {
+    roster: Vec<(String, String)>,
+    registry: DeviceRegistry,
 }
 
 impl<T: MeshTransport> ClusterDaemon<T> {
@@ -148,6 +163,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
             single_group: None,
             groups: HashMap::new(),
             shared_files: HashMap::new(),
+            device_state: HashMap::new(),
         }
     }
 
@@ -237,7 +253,48 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         group: &str,
         roster: &[(String, String)],
     ) -> Result<Vec<String>, String> {
+        self.set_roster_with_devices(group, roster, &[], &[])
+            .map(|(evicted, _)| evicted)
+    }
+
+    /// HUP-S8.1: [`set_roster`](Self::set_roster) plus the group's signed device links and member
+    /// revocations, in ONE reconcile. Links are verified (member, device and wallet signatures, real
+    /// secp256k1), revocations are recorded for good, and every allowed member's linked, unrevoked
+    /// devices join the allowed set with the member's role (`cluster_core::device::effective_roster`).
+    /// A device whose link is missing, forged, revoked or contested is not in the allowed set, so the
+    /// existing gate de-authorizes and evicts it in this same call. The links sent here REPLACE the
+    /// previous set (the client is the source of truth); revocations only ever accumulate. Returns
+    /// `(evicted, rejected)`, where `rejected` holds one secret-free reason per refused item.
+    pub fn set_roster_with_devices(
+        &mut self,
+        group: &str,
+        roster: &[(String, String)],
+        links: &[DeviceLinkWire],
+        revocations: &[RevocationWire],
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         self.ensure_group_allowed(group)?;
+        let links: Vec<_> = links.iter().map(Into::into).collect();
+        let revocations: Vec<_> = revocations.iter().map(Into::into).collect();
+        let state = self.device_state.entry(group.to_string()).or_default();
+        let rejected: Vec<String> = state
+            .registry
+            .update(&links, &revocations, &Eip191Verifier)
+            .iter()
+            .map(describe_rejection)
+            .collect();
+        state.roster = roster.to_vec();
+        let effective = effective_roster(roster, &state.registry);
+        self.apply_roster(group, &effective)
+            .map(|evicted| (evicted, rejected))
+    }
+
+    /// Reconcile a group's session to an (already effective) roster: evict, de-authorize removed
+    /// addresses, authorize the rest. The body `set_roster` always had.
+    fn apply_roster(
+        &mut self,
+        group: &str,
+        roster: &[(String, String)],
+    ) -> Result<Vec<String>, String> {
         let session = self.ensure_session(group);
         let before: BTreeSet<String> = session.membership().allowed().into_iter().collect();
         let evicted = session.reconcile(roster);
@@ -265,6 +322,8 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     pub fn leave(&mut self, group: &str) {
         self.groups.remove(group);
         self.shared_files.remove(group);
+        // Device links and revocations are NOT forgotten on leave: a revocation must outlive a
+        // leave/re-join, and the next SetRoster replaces the link set anyway.
     }
 
     /// `(connected, authorized, sharedFiles)` for a group. Drains any newly-received mesh messages
@@ -297,6 +356,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         let Some(s) = self.groups.get(group) else {
             return Vec::new();
         };
+        let registry = self.device_state.get(group).map(|g| &g.registry);
         let connected: std::collections::BTreeSet<String> =
             s.transport().connected().into_iter().collect();
         s.membership()
@@ -304,8 +364,33 @@ impl<T: MeshTransport> ClusterDaemon<T> {
             .into_iter()
             .map(|address| {
                 let online = connected.contains(&address);
-                PeerView { address, online }
+                let member = registry
+                    .and_then(|r| r.member_of(&address))
+                    .map(str::to_string);
+                PeerView {
+                    address,
+                    online,
+                    member,
+                }
             })
+            .collect()
+    }
+
+    /// HUP-S8.1: the group's allowed members, each with its linked devices and live state. Unknown
+    /// group -> `[]`.
+    pub fn devices(&mut self, group: &str) -> Vec<MemberDevicesWire> {
+        self.sync_admission(group);
+        let Some(state) = self.device_state.get(group) else {
+            return Vec::new();
+        };
+        let connected: BTreeSet<String> = self
+            .groups
+            .get(group)
+            .map(|s| s.transport().connected().into_iter().collect())
+            .unwrap_or_default();
+        device_roster(&state.roster, &state.registry)
+            .into_iter()
+            .map(|m| MemberDevicesWire::from_core(m, &connected))
             .collect()
     }
 
@@ -383,3 +468,5 @@ impl<T: MeshTransport> ClusterDaemon<T> {
 
 #[cfg(test)]
 mod daemon_tests;
+#[cfg(test)]
+mod device_daemon_tests;
