@@ -286,3 +286,84 @@ fn pba_l6b_006_admission_gate_config_invariants() {
         "un-identified peers are reaped promptly"
     );
 }
+
+// HUP-S8.4 (CL-S4 prep): admission is decided at `identify`, so a peer that dialed before it was
+// authorized is dropped. Before this, nothing ever dialed it again: the member had to restart the
+// app on one side. The transport now re-dials its bootstrap peers on a timer while they are not
+// connected, so authorizing a peer later (a DeviceLink learned after start-up) lets it in without a
+// restart. Red before the redial timer existed (B stayed disconnected forever).
+#[test]
+fn a_peer_refused_before_authorization_gets_in_after_it_is_authorized() {
+    const GROUP: &str = "group-late-authorization";
+
+    // A starts and authorizes NOBODY yet.
+    let mut a = transport(0x3A, GROUP, vec![]);
+    let a_listen = wait_listener(&a);
+    let (addr_a, peer_a) =
+        Libp2pTransport::identity_from_secret(test_secret(0x3A)).expect("identity of A");
+    let a_full: Multiaddr = format!("{a_listen}/p2p/{peer_a}")
+        .parse()
+        .expect("bootstrap multiaddr with peer id");
+
+    // B knows A as a bootstrap peer and authorizes A; A refuses B at identify.
+    let mut b = transport(0x3B, GROUP, vec![a_full]);
+    let addr_b = b.self_address().to_string();
+    b.dial(&addr_a);
+    sleep(Duration::from_millis(2_000));
+    assert!(
+        !a.connected().contains(&addr_b),
+        "an unauthorized peer is refused at identify (precondition)"
+    );
+
+    // Later, A learns that B is allowed (a roster or DeviceLink update). No restart, no manual dial.
+    a.dial(&addr_b);
+    let deadline = Instant::now() + BOOTSTRAP_REDIAL * 3 + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if a.connected().contains(&addr_b) && b.connected().contains(&addr_a) {
+            break;
+        }
+        sleep(Duration::from_millis(200));
+    }
+    assert!(
+        a.connected().contains(&addr_b),
+        "B is admitted once authorized, through the redial"
+    );
+    assert!(b.connected().contains(&addr_a), "and B sees A");
+}
+
+// The redial choice, pure: a bootstrap address naming a peer id is re-dialed only while that peer
+// is not connected; one without a peer id only while nobody is admitted. Bounded per tick.
+#[test]
+fn redial_targets_skip_connected_peers_and_are_bounded() {
+    let (_, p1) = Libp2pTransport::identity_from_secret(test_secret(0x41)).expect("id");
+    let (_, p2) = Libp2pTransport::identity_from_secret(test_secret(0x42)).expect("id");
+    let with_id = |port: u16, p: &str| -> Multiaddr {
+        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{p}")
+            .parse()
+            .expect("multiaddr")
+    };
+    let a1 = with_id(4001, &p1);
+    let a2 = with_id(4002, &p2);
+    let bare: Multiaddr = "/ip4/127.0.0.1/tcp/4003".parse().expect("multiaddr");
+    let list = vec![a1.clone(), a2.clone(), bare.clone()];
+    let pid1: PeerId = p1.parse().expect("peer id");
+
+    // Nobody connected: everything is due.
+    let due = redial_targets(&list, |_| false, false);
+    assert_eq!(due, list);
+    // p1 connected and someone admitted: only p2 is due (the bare address is skipped).
+    let due = redial_targets(&list, |p| *p == pid1, true);
+    assert_eq!(due, vec![a2.clone()]);
+    // A long list is capped per tick.
+    let many: Vec<Multiaddr> = (0..(MAX_REDIAL_PER_TICK + 10))
+        .map(|i| {
+            format!("/ip4/127.0.0.1/tcp/{}", 5000 + i)
+                .parse()
+                .expect("ma")
+        })
+        .collect();
+    assert_eq!(
+        redial_targets(&many, |_| false, false).len(),
+        MAX_REDIAL_PER_TICK
+    );
+}

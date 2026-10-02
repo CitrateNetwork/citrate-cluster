@@ -47,10 +47,12 @@
 //!   fully-connected small mesh, every publisher is a direct peer). Multi-hop relay of not-yet-
 //!   identified sources is dropped; larger-mesh source resolution is future work (soak ladder, CL-S3).
 //! * **Authorize-before-connect**: admission is decided once, at the `identify` handshake. A peer that
-//!   connects before its address is authorized (via `dial`) is dropped and does not auto-rejoin when
-//!   later authorized — it must redial. The intended flow authorizes first (cluster-core sets the
-//!   roster, then the mesh dials), so this is a natural ordering, not a gap in the invariant; a
-//!   re-admit-on-authorization-change hook is a possible S2 refinement.
+//!   connects before its address is authorized (via `dial`) is dropped. HUP-S8.4: every node re-dials
+//!   its bootstrap peers that are not connected every [`BOOTSTRAP_REDIAL`] (at most
+//!   [`MAX_REDIAL_PER_TICK`] per tick, [`MAX_BOOTSTRAP`] kept), so a peer authorized later (a roster or
+//!   DeviceLink update) gets in on the next re-dial from either side that knows the other's address,
+//!   without a restart. Each re-dial is still admitted only at `identify`, so the invariant is
+//!   unchanged; a refused peer costs one Noise handshake per interval.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -98,6 +100,17 @@ const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the swarm task sweeps for connections past [`IDENTIFY_TIMEOUT`].
 const IDENTIFY_SWEEP: Duration = Duration::from_millis(500);
+
+/// HUP-S8.4 (CL-S4 prep): how often the swarm re-dials bootstrap peers that are not connected.
+/// Admission is decided at `identify`, so a peer that connected before it was authorized is dropped;
+/// re-dialing lets it in once a roster or DeviceLink update authorizes it, without a restart.
+pub(crate) const BOOTSTRAP_REDIAL: Duration = Duration::from_secs(5);
+
+/// Most bootstrap addresses the swarm keeps for re-dial (start-up list plus requested dials).
+pub(crate) const MAX_BOOTSTRAP: usize = 64;
+
+/// Most bootstrap addresses re-dialed per tick (bounds the work an oversized list can cause).
+pub(crate) const MAX_REDIAL_PER_TICK: usize = 16;
 
 /// PBA-L6b-006: the gossipsub application score given to every peer that is not (yet) admitted.
 /// It sits below the gossip and publish thresholds (so the peer is never sent a publication, a
@@ -242,11 +255,17 @@ impl Libp2pTransport {
                     addr: listen.clone(),
                     reason: e.to_string(),
                 })?;
-            for addr in bootstrap {
+            for addr in &bootstrap {
                 // Tolerate transient dial failures — inbound admission still gates every peer.
-                let _ = swarm.dial(addr);
+                let _ = swarm.dial(addr.clone());
             }
-            let task = tokio::spawn(swarm_loop(swarm, topic_task, cmd_rx, shared_task));
+            let task = tokio::spawn(swarm_loop(
+                swarm,
+                topic_task,
+                cmd_rx,
+                shared_task,
+                bootstrap,
+            ));
             Ok::<_, TransportError>(task)
         })?;
 
@@ -534,12 +553,18 @@ async fn swarm_loop(
     topic_name: String,
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCmd>,
     shared: Arc<Mutex<Shared>>,
+    mut bootstrap: Vec<Multiaddr>,
 ) {
     // PeerId → resolved member address, for authenticated senders we have identified.
     let mut peer_addr: HashMap<PeerId, String> = HashMap::new();
     // PBA-L6b-006: connections established but not yet identified, with when they were first seen.
     let mut unidentified: HashMap<PeerId, Instant> = HashMap::new();
     let mut sweep = tokio::time::interval(IDENTIFY_SWEEP);
+    // HUP-S8.4: re-dial bootstrap peers that are not connected (the first tick fires at once and is
+    // skipped, since start-up already dialed them).
+    let mut redial = tokio::time::interval(BOOTSTRAP_REDIAL);
+    redial.tick().await;
+    bootstrap.truncate(MAX_BOOTSTRAP);
     let topic_hash = gossipsub::IdentTopic::new(topic_name.clone()).hash();
 
     loop {
@@ -558,6 +583,12 @@ async fn swarm_loop(
                     let _ = swarm.disconnect_peer_id(p);
                 }
             }
+            _ = redial.tick() => {
+                let any_admitted = !peer_addr.is_empty();
+                for addr in redial_targets(&bootstrap, |p| swarm.is_connected(p), any_admitted) {
+                    let _ = swarm.dial(addr);
+                }
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return; }; // surface dropped → shut down
                 match cmd {
@@ -567,6 +598,10 @@ async fn swarm_loop(
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic, bytes);
                     }
                     SwarmCmd::Dial(addr) => {
+                        // A peer dialed on request is kept for re-dial like a bootstrap peer.
+                        if !bootstrap.contains(&addr) && bootstrap.len() < MAX_BOOTSTRAP {
+                            bootstrap.push(addr.clone());
+                        }
                         let _ = swarm.dial(addr);
                     }
                     SwarmCmd::Disconnect(address) => {
@@ -673,6 +708,33 @@ async fn swarm_loop(
             }
         }
     }
+}
+
+/// The peer id a bootstrap multiaddr names (its trailing `/p2p/<id>`), if any.
+fn bootstrap_peer_id(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+        _ => None,
+    })
+}
+
+/// HUP-S8.4: the bootstrap addresses due for a re-dial. An address naming a peer id is due while
+/// that peer is not connected; one without a peer id is due only while no peer is admitted (it
+/// cannot be matched to a connection). At most [`MAX_REDIAL_PER_TICK`] per tick.
+pub(crate) fn redial_targets(
+    bootstrap: &[Multiaddr],
+    is_connected: impl Fn(&PeerId) -> bool,
+    any_admitted: bool,
+) -> Vec<Multiaddr> {
+    bootstrap
+        .iter()
+        .filter(|a| match bootstrap_peer_id(a) {
+            Some(id) => !is_connected(&id),
+            None => !any_admitted,
+        })
+        .take(MAX_REDIAL_PER_TICK)
+        .cloned()
+        .collect()
 }
 
 /// PBA-L6b-037: a gossip payload is accepted only if it is UTF-8 AND a well-formed CID (the only
