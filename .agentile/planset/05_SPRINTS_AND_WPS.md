@@ -106,3 +106,29 @@ over UDS, feeding rosters from the comms daemon, and surfacing `sharedFiles` in 
 `ClusterStatus`. That lives in citrate-core (`cluster.rs`/bridge), tracked as gate2 `g2-wiring`, and is
 a separate change. Multi-group-per-process and re-admit-on-authorization-change (noted under CL-S1
 gaps) remain follow-ons.
+
+## HUP-S8.4 prep (2026-10-01, branch `hup/n5-fleet-rest`): re-dial, multi-process proofs, soak kit
+
+Toward CL-S3/CL-S4; nothing here flips a gate.
+
+- **Re-admit after authorization (the CL-S1 gap above).** The swarm re-dials its bootstrap peers
+  that are not connected every 5 s (at most 16 per tick, 64 kept; requested dials are kept too).
+  A peer refused at `identify` because it was not yet authorized gets in on the next re-dial once a
+  roster or DeviceLink update authorizes it, without a restart. Admission is still decided only at
+  `identify`, so `connected ⊆ admitted ⊆ allowed` is unchanged. Red-green:
+  `a_peer_refused_before_authorization_gets_in_after_it_is_authorized` failed before the timer.
+- **Multi-process proofs on one machine** (`tests/fleet_multiprocess.rs`): another member's device
+  admitted when its link arrives late (no restart; mutation-checked by stretching the re-dial to an
+  hour, which fails it), and a three-device, two-member full mesh where a revocation evicts one
+  device from both nodes that apply it while its re-dials stay refused.
+- **Single-machine ladder control** (`tests/ladder_multiprocess.rs`): N processes, one member and
+  device each, full mesh, one co-pin to all. N = 4 runs in the suite; N = 16, 32, 50 ran green on an
+  Apple M-series Mac (numbers in `scripts/soak/DEVICELINK_MULTI_MACHINE.md`). Honest limits: no
+  peer discovery (every node bootstraps to every node), and 64 incoming connections per node put
+  the full-mesh ceiling near 65 nodes. The real ladder (separate machines, 50 to 2000) is still CL-S3.
+- **Soak kit for the DGX team:** `examples/devicelink_fixture.rs` (fresh test keys only; member and
+  wallet secrets never written), `scripts/soak/devicelink-node.sh`, `soakctl.py set-roster-json` and
+  `devices`, runbook `scripts/soak/DEVICELINK_MULTI_MACHINE.md` (two- and three-machine steps).
+  Dry-run on one Mac over loopback: both flows PASS.
+
+Workspace tests 104 to 109 (+1 ignored ladder step).
