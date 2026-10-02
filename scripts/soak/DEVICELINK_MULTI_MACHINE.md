@@ -16,7 +16,7 @@ networks what `crates/cluster-daemon/tests/fleet_multiprocess.rs` proves on one 
 4. a revocation evicts the device from every node that applies it, and its re-dials are refused.
 
 The app-level run (wizard, ceremony, two people at two machines) is separate:
-citrate-core `docs/FLEET_TWO_MACHINE_TEST.md`.
+citrate-core `docs/FLEET_MULTI_MACHINE_TEST.md` (branch `hup/n5-fleet-rest`).
 
 ## Keys
 
