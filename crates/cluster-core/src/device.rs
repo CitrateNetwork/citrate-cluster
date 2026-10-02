@@ -36,6 +36,17 @@
 //! mints a fresh device key and gets a fresh link. A revocation only counts when it is signed by the
 //! member that the device is linked to, so one member cannot evict another member's machine.
 //!
+//! Once a member has linked a device (or revoked one), its comms identity stops being a peer: the
+//! member is admitted only through its device keys (ADR-003), so a revoked machine cannot simply
+//! rejoin as the wallet-derived comms identity.
+//!
+//! ## What revocation does not do
+//!
+//! Revocation retires a device KEY. It is not a boundary against a machine that still holds the
+//! member's wallet: such a machine can derive the comms key, mint a fresh device key and sign a new
+//! link for it, which admits like any other link. Cutting off a lost or stolen machine for good
+//! takes a new wallet (and so a new comms key). Member-facing wording has to say this.
+//!
 //! ## Purity
 //!
 //! This crate stays free of crypto, I/O and networking (CLAUDE.md rule 3). Signature recovery is
@@ -398,6 +409,13 @@ impl DeviceRegistry {
 /// offboarded (or drops below Member) leaves this set in the same step, and a revoked device is
 /// never in it. A device address that is ALSO a roster member keeps only its member entry (a key
 /// cannot be both a member identity and somebody's device), which keeps peer ids one-to-one.
+///
+/// **A member on device keys is admitted only through them.** The member's comms identity is
+/// wallet-derived, so every machine holding the wallet can present it. Once a member has an active
+/// device in this set, or has revoked a device, its comms identity is dropped from the admitted
+/// roster (ADR-003); otherwise a revoked machine would rejoin as that identity. A member that has
+/// never linked or revoked a device keeps its single-device comms identity, as before. The comms
+/// identity still authorizes links and revocations; it just stops being a peer.
 pub fn effective_roster(
     roster: &[(String, String)],
     registry: &DeviceRegistry,
@@ -415,10 +433,11 @@ pub fn effective_roster(
             }
         }
     }
-    let mut out: Vec<(String, String)> = role_of
-        .iter()
-        .map(|(a, r)| (a.clone(), r.clone()))
-        .collect();
+    let mut devices: Vec<(String, String)> = Vec::new();
+    // Members admitted through device keys only: an active device in this roster, or a verified
+    // revocation of their own (so revoking the last device never restores the comms identity).
+    let mut on_device_keys: BTreeSet<&String> =
+        registry.revoked.iter().map(|(member, _)| member).collect();
     for l in registry.links.values() {
         if role_of.contains_key(&l.device) {
             continue; // a member key is never also a device
@@ -426,10 +445,17 @@ pub fn effective_roster(
         // The member must itself pass the cluster gate (on the roster, role >= Member).
         if let Some(role) = role_of.get(&l.member) {
             if role_rank(role) >= MIN_CLUSTER_RANK {
-                out.push((l.device.clone(), role.clone()));
+                devices.push((l.device.clone(), role.clone()));
+                on_device_keys.insert(&l.member);
             }
         }
     }
+    let mut out: Vec<(String, String)> = role_of
+        .iter()
+        .filter(|(a, _)| !on_device_keys.contains(a))
+        .map(|(a, r)| (a.clone(), r.clone()))
+        .collect();
+    out.extend(devices);
     out.sort();
     out
 }

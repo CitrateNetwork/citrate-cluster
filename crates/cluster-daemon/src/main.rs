@@ -19,7 +19,9 @@
 //!                                Noise/peer identity is bound to this key. HUP-S8.1: this is the
 //!                                DEVICE key (random per machine, linked to the member by a signed
 //!                                DeviceLink), so the PeerId is per device; a client without a
-//!                                link still passes its comms key (legacy single-device identity).
+//!                                link still passes its comms key (legacy single-device identity),
+//!                                which the mesh admits only until the member links or revokes a
+//!                                device (ADR-003).
 //!                                Never the wallet key. The secret NEVER crosses argv/env (they
 //!                                leak to `ps`), only a file.
 //!   CITRATE_CLUSTER_GROUP        the group id == the gossipsub topic (one group per daemon in S1)

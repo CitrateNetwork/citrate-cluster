@@ -51,8 +51,10 @@ fn linked_devices_are_allowed_under_their_member_with_distinct_identities() {
     assert!(evicted.is_empty() && rejected.is_empty(), "{rejected:?}");
     assert!(d.admit_peer(G, &addr(&f.laptop), "member"));
     assert!(d.admit_peer(G, &addr(&f.linux), "member"));
+    // ADR-003: the member's comms identity is not a peer once it has linked devices.
+    assert!(!d.admit_peer(G, &addr(&f.member), "member"));
     let peers = d.peers(G);
-    assert_eq!(peers.len(), 3, "member identity + two devices: {peers:?}");
+    assert_eq!(peers.len(), 2, "two devices, no comms identity: {peers:?}");
     for dev in [&f.laptop, &f.linux] {
         let p = peers
             .iter()
@@ -61,11 +63,37 @@ fn linked_devices_are_allowed_under_their_member_with_distinct_identities() {
         assert!(p.online);
         assert_eq!(p.member.as_deref(), Some(addr(&f.member).as_str()));
     }
-    let me = peers
-        .iter()
-        .find(|p| p.address == addr(&f.member))
-        .expect("member listed");
-    assert_eq!(me.member, None);
+    assert!(!peers.iter().any(|p| p.address == addr(&f.member)));
+}
+
+#[test]
+fn a_revoked_machine_holding_the_wallet_cannot_rejoin_as_the_comms_identity() {
+    let f = fleet();
+    let mut d = daemon();
+    d.set_roster_with_devices(G, &member_roster(&f, "member"), &links(&f), &[])
+        .unwrap();
+    assert!(d.admit_peer(G, &addr(&f.linux), "member"));
+    // Revoke both machines: the member has no active device left.
+    let revs = [
+        real_revocation(&f.member, &f.linux),
+        real_revocation(&f.member, &f.laptop),
+    ];
+    let (evicted, _) = d
+        .set_roster_with_devices(G, &member_roster(&f, "member"), &links(&f), &revs)
+        .unwrap();
+    assert_eq!(evicted, vec![addr(&f.linux)]);
+    // The linux box can still derive the comms key from the wallet; that identity stays out.
+    assert!(!d.admit_peer(G, &addr(&f.member), "member"));
+    assert!(d.peers(G).is_empty());
+}
+
+#[test]
+fn a_member_with_no_device_links_keeps_meshing_as_its_comms_identity() {
+    let f = fleet();
+    let mut d = daemon();
+    d.set_roster_with_devices(G, &member_roster(&f, "member"), &[], &[])
+        .unwrap();
+    assert!(d.admit_peer(G, &addr(&f.member), "member"));
 }
 
 #[test]
