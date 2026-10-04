@@ -599,9 +599,7 @@ async fn swarm_loop(
                     }
                     SwarmCmd::Dial(addr) => {
                         // A peer dialed on request is kept for re-dial like a bootstrap peer.
-                        if !bootstrap.contains(&addr) && bootstrap.len() < MAX_BOOTSTRAP {
-                            bootstrap.push(addr.clone());
-                        }
+                        remember_bootstrap(&mut bootstrap, addr.clone());
                         let _ = swarm.dial(addr);
                     }
                     SwarmCmd::Disconnect(address) => {
@@ -708,6 +706,19 @@ async fn swarm_loop(
             }
         }
     }
+}
+
+/// Keep `addr` for re-dial: an address already listed stays where it is; a full list
+/// ([`MAX_BOOTSTRAP`]) drops its oldest entry first, so a peer dialed late in a long session is still
+/// re-dialed.
+pub(crate) fn remember_bootstrap(bootstrap: &mut Vec<Multiaddr>, addr: Multiaddr) {
+    if bootstrap.contains(&addr) {
+        return;
+    }
+    if bootstrap.len() >= MAX_BOOTSTRAP {
+        bootstrap.remove(0);
+    }
+    bootstrap.push(addr);
 }
 
 /// The peer id a bootstrap multiaddr names (its trailing `/p2p/<id>`), if any.

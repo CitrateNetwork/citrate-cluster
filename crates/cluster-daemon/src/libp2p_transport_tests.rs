@@ -367,3 +367,30 @@ fn redial_targets_skip_connected_peers_and_are_bounded() {
         MAX_REDIAL_PER_TICK
     );
 }
+
+// Review fix (fan-out 6): the re-dial list used to stop growing at MAX_BOOTSTRAP, so after 64
+// different peers had been dialed (roster churn over a long session) a newly authorized peer was
+// dialed once and never re-dialed. The list now keeps the newest addresses: a full list drops its
+// oldest entry, and an address already listed is not added twice.
+#[test]
+fn the_redial_list_keeps_the_newest_addresses_when_full() {
+    let ma = |port: usize| -> Multiaddr {
+        format!("/ip4/127.0.0.1/tcp/{}", 6000 + port)
+            .parse()
+            .expect("multiaddr")
+    };
+    let mut list: Vec<Multiaddr> = (0..MAX_BOOTSTRAP).map(ma).collect();
+    remember_bootstrap(&mut list, ma(0));
+    assert_eq!(
+        list.len(),
+        MAX_BOOTSTRAP,
+        "a listed address is not added twice"
+    );
+    remember_bootstrap(&mut list, ma(MAX_BOOTSTRAP));
+    assert_eq!(list.len(), MAX_BOOTSTRAP);
+    assert!(
+        list.contains(&ma(MAX_BOOTSTRAP)),
+        "the newest address is kept"
+    );
+    assert!(!list.contains(&ma(0)), "the oldest one made room");
+}
