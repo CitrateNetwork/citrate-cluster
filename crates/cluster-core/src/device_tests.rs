@@ -336,7 +336,8 @@ fn devices_inherit_their_members_role() {
         &FakeVerifier,
     );
     let eff = effective_roster(&roster(&[(M1, "admin")]), &reg);
-    assert_eq!(eff, roster(&[(M1, "admin"), (D1, "admin"), (D2, "admin")]));
+    // ADR-003: with devices linked, the member is admitted through them only.
+    assert_eq!(eff, roster(&[(D1, "admin"), (D2, "admin")]));
 }
 
 #[test]
@@ -449,4 +450,131 @@ fn device_roster_lists_devices_under_their_member() {
     assert_eq!(view[0].member, M1);
     let labels: Vec<&str> = view[0].devices.iter().map(|d| d.label.as_str()).collect();
     assert_eq!(labels, vec!["laptop", "box"]);
+}
+
+// ---- the member's comms identity once the member uses device keys ----
+//
+// The comms key is derived from the wallet, so every machine that holds the wallet can present it.
+// While a member's comms identity stays admitted next to its linked devices, a revoked machine
+// simply rejoins as that identity. Once a member has a linked device (or has revoked one), the
+// member is admitted ONLY through its device keys.
+
+#[test]
+fn a_member_with_linked_devices_is_admitted_only_through_its_devices() {
+    let mut reg = DeviceRegistry::new();
+    reg.update(
+        &[
+            signed(link(M1, D1, W1, 0, "laptop")),
+            signed(link(M1, D2, W1, 1, "box")),
+        ],
+        &[],
+        &FakeVerifier,
+    );
+    let eff = effective_roster(&roster(&[(M1, "member"), (M2, "member")]), &reg);
+    // M2 has no devices and keeps its single-device identity; M1's comms identity is gone.
+    assert_eq!(
+        eff,
+        roster(&[(M2, "member"), (D1, "member"), (D2, "member")])
+    );
+    let mut m = ClusterMembership::new(&eff);
+    assert!(!m.join(M1, "member"), "the comms identity no longer admits");
+    assert!(m.join(D1, "member"));
+}
+
+#[test]
+fn a_revoked_machine_cannot_rejoin_as_the_members_comms_identity() {
+    let mut reg = DeviceRegistry::new();
+    let links = [
+        signed(link(M1, D1, W1, 0, "laptop")),
+        signed(link(M1, D2, W1, 1, "box")),
+    ];
+    let r = roster(&[(M1, "member")]);
+    reg.update(&links, &[], &FakeVerifier);
+    let mut m = ClusterMembership::new(&effective_roster(&r, &reg));
+    assert!(m.join(D2, "member"));
+    reg.update(&links, &[revoke(M1, D2)], &FakeVerifier);
+    let evicted = m.reconcile(&effective_roster(&r, &reg));
+    assert_eq!(evicted, vec![D2.to_string()]);
+    // The box still holds the wallet, so it can present M1's comms key. That must not admit.
+    assert!(!m.join(M1, "member"));
+    assert!(m.invariant_holds());
+}
+
+#[test]
+fn revoking_the_last_device_does_not_restore_the_comms_identity() {
+    let mut reg = DeviceRegistry::new();
+    let links = [signed(link(M1, D1, W1, 0, "laptop"))];
+    reg.update(&links, &[revoke(M1, D1)], &FakeVerifier);
+    assert!(reg.devices_of(M1).is_empty());
+    let eff = effective_roster(&roster(&[(M1, "member")]), &reg);
+    assert!(
+        allowed_set(&eff).is_empty(),
+        "a member that has revoked a device stays on device keys: {eff:?}"
+    );
+}
+
+#[test]
+fn a_member_without_devices_keeps_its_single_device_identity() {
+    let mut reg = DeviceRegistry::new();
+    // Somebody else's device and somebody else's revocation do not touch M1.
+    reg.update(
+        &[signed(link(M2, D3, W2, 0, "theirs"))],
+        &[revoke(M2, D2)],
+        &FakeVerifier,
+    );
+    let eff = effective_roster(&roster(&[(M1, "member"), (M2, "member")]), &reg);
+    assert_eq!(eff, roster(&[(M1, "member"), (D3, "member")]));
+}
+
+#[test]
+fn an_unverified_revocation_does_not_switch_a_member_to_device_keys() {
+    let mut reg = DeviceRegistry::new();
+    let mut forged = revoke(M1, D1);
+    forged.member_sig = fake_sign(M2, &forged.revocation.signing_message());
+    reg.update(&[], &[forged], &FakeVerifier);
+    let eff = effective_roster(&roster(&[(M1, "member")]), &reg);
+    assert_eq!(eff, roster(&[(M1, "member")]));
+}
+
+#[test]
+fn a_guest_with_a_link_is_still_not_admitted_either_way() {
+    let mut reg = DeviceRegistry::new();
+    reg.update(&[signed(link(M1, D1, W1, 0, "laptop"))], &[], &FakeVerifier);
+    let eff = effective_roster(&roster(&[(M1, "guest")]), &reg);
+    assert!(allowed_set(&eff).is_empty(), "{eff:?}");
+}
+
+#[test]
+fn a_later_update_without_the_members_links_keeps_a_revoker_off_its_comms_identity() {
+    // Links are replaced by every roster update; only revocations are sticky. A member that has
+    // revoked a device stays on device keys even when a later update carries none of its links.
+    let mut reg = DeviceRegistry::new();
+    let r = roster(&[(M1, "member")]);
+    reg.update(
+        &[
+            signed(link(M1, D1, W1, 0, "laptop")),
+            signed(link(M1, D2, W1, 1, "box")),
+        ],
+        &[revoke(M1, D2)],
+        &FakeVerifier,
+    );
+    assert_eq!(effective_roster(&r, &reg), roster(&[(D1, "member")]));
+    reg.update(&[], &[], &FakeVerifier);
+    assert!(
+        allowed_set(&effective_roster(&r, &reg)).is_empty(),
+        "the revoked box must not come back as the comms identity"
+    );
+}
+
+#[test]
+fn a_member_whose_links_are_withdrawn_without_a_revocation_is_back_on_its_comms_identity() {
+    // The client is the source of truth for links: withdrawing a link is not a revocation, so a
+    // member that never revoked anything returns to its single-device identity (modelled as
+    // DropLink in formal/DeviceLink.tla).
+    let mut reg = DeviceRegistry::new();
+    let r = roster(&[(M1, "member")]);
+    reg.update(&[signed(link(M1, D1, W1, 0, "laptop"))], &[], &FakeVerifier);
+    assert_eq!(effective_roster(&r, &reg), roster(&[(D1, "member")]));
+    reg.update(&[], &[], &FakeVerifier);
+    assert_eq!(effective_roster(&r, &reg), roster(&[(M1, "member")]));
 }
