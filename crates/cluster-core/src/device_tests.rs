@@ -543,3 +543,38 @@ fn a_guest_with_a_link_is_still_not_admitted_either_way() {
     let eff = effective_roster(&roster(&[(M1, "guest")]), &reg);
     assert!(allowed_set(&eff).is_empty(), "{eff:?}");
 }
+
+#[test]
+fn a_later_update_without_the_members_links_keeps_a_revoker_off_its_comms_identity() {
+    // Links are replaced by every roster update; only revocations are sticky. A member that has
+    // revoked a device stays on device keys even when a later update carries none of its links.
+    let mut reg = DeviceRegistry::new();
+    let r = roster(&[(M1, "member")]);
+    reg.update(
+        &[
+            signed(link(M1, D1, W1, 0, "laptop")),
+            signed(link(M1, D2, W1, 1, "box")),
+        ],
+        &[revoke(M1, D2)],
+        &FakeVerifier,
+    );
+    assert_eq!(effective_roster(&r, &reg), roster(&[(D1, "member")]));
+    reg.update(&[], &[], &FakeVerifier);
+    assert!(
+        allowed_set(&effective_roster(&r, &reg)).is_empty(),
+        "the revoked box must not come back as the comms identity"
+    );
+}
+
+#[test]
+fn a_member_whose_links_are_withdrawn_without_a_revocation_is_back_on_its_comms_identity() {
+    // The client is the source of truth for links: withdrawing a link is not a revocation, so a
+    // member that never revoked anything returns to its single-device identity (modelled as
+    // DropLink in formal/DeviceLink.tla).
+    let mut reg = DeviceRegistry::new();
+    let r = roster(&[(M1, "member")]);
+    reg.update(&[signed(link(M1, D1, W1, 0, "laptop"))], &[], &FakeVerifier);
+    assert_eq!(effective_roster(&r, &reg), roster(&[(D1, "member")]));
+    reg.update(&[], &[], &FakeVerifier);
+    assert_eq!(effective_roster(&r, &reg), roster(&[(M1, "member")]));
+}

@@ -31,6 +31,9 @@
 (* linking or revoking evicts it in the same step.                         *)
 (*   LegacyAdmit(m)  a machine meshes as member m's comms identity          *)
 (*   LegacyLeave(m)  that connection closes                                 *)
+(*   DropLink(d)     the client stops sending d's link without revoking it  *)
+(*                   (links are REPLACED by every roster update; only       *)
+(*                   revocations are sticky, as in cluster-daemon)          *)
 (***************************************************************************)
 EXTENDS FiniteSets, Naturals
 
@@ -46,9 +49,11 @@ VARIABLES
     links,      \* set of <<device, member>> links that verified
     revoked,    \* devices whose member revoked them (sticky)
     admitted,   \* devices currently meshed
-    legacy      \* member comms identities currently meshed (ADR-003)
+    legacy,     \* member comms identities currently meshed (ADR-003)
+    revokedBy,  \* <<device, member>> revocations, sticky (cluster-core DeviceRegistry.revoked)
+    revokeLog   \* history only, never read by an action: every <<device, member>> a member revoked
 
-vars == <<allowed, key, links, revoked, admitted, legacy>>
+vars == <<allowed, key, links, revoked, admitted, legacy, revokedBy, revokeLog>>
 
 \* The PeerId is derived from the device key. Modelled as the key itself: any injective function
 \* gives the same verdicts, and libp2p's PeerId-from-public-key is injective.
@@ -63,9 +68,12 @@ AllowedDevices == {d \in Devices : LinkedToAllowed(d) /\ d \notin revoked}
 
 UsedKeys == {key[d] : d \in Devices} \ {NoKey}
 
-\* A member is on device keys once it has linked a device (revoked or not: a revocation needs a
-\* link, and the implementation seeds this set from verified revocations too).
-OnDeviceKeys(m) == \E d \in Devices : <<d, m>> \in links
+\* A member is on device keys while the client sends a link of one of its devices, or for good once
+\* it has revoked one (cluster-core effective_roster seeds this set from the sticky revocations, so
+\* a later update that no longer carries the member's links does not restore the comms identity).
+OnDeviceKeys(m) ==
+    \/ \E d \in Devices : <<d, m>> \in links
+    \/ \E d \in Devices : <<d, m>> \in revokedBy
 
 \* The comms identities the admission gate accepts (cluster-core effective_roster).
 LegacyAllowed == {m \in allowed : ~OnDeviceKeys(m)}
@@ -77,6 +85,8 @@ TypeOK ==
     /\ revoked \subseteq Devices
     /\ admitted \subseteq Devices
     /\ legacy \subseteq Members
+    /\ revokedBy \subseteq Devices \X Members
+    /\ revokeLog \subseteq Devices \X Members
 
 Init ==
     /\ allowed \in SUBSET Members
@@ -85,13 +95,15 @@ Init ==
     /\ revoked = {}
     /\ admitted = {}
     /\ legacy = {}
+    /\ revokedBy = {}
+    /\ revokeLog = {}
 
 \* A device draws a fresh random key. Two devices never hold the same key (the device key is
 \* random per machine; this is exactly what the wallet-derived comms key could NOT give).
 MintKey(d) ==
     /\ key[d] = NoKey
     /\ \E k \in Keys \ UsedKeys : key' = [key EXCEPT ![d] = k]
-    /\ UNCHANGED <<allowed, links, revoked, admitted, legacy>>
+    /\ UNCHANGED <<allowed, links, revoked, admitted, legacy, revokedBy, revokeLog>>
 
 \* Member m signs a link for device d. The device must hold a key (it co-signs: proof of
 \* possession). A revoked key is never re-linked, and a key linked to one member cannot be
@@ -102,19 +114,19 @@ IssueLink(d, m) ==
     /\ MemberOf(d) \subseteq {m}
     /\ links' = links \cup {<<d, m>>}
     /\ legacy' = legacy \ {m}       \* ADR-003: the member's comms identity leaves in this step
-    /\ UNCHANGED <<allowed, key, revoked, admitted>>
+    /\ UNCHANGED <<allowed, key, revoked, admitted, revokedBy, revokeLog>>
 
 \* identify-time admission: only a device in the effective allowed set is meshed.
 Admit(d) ==
     /\ d \in AllowedDevices
     /\ d \notin admitted
     /\ admitted' = admitted \cup {d}
-    /\ UNCHANGED <<allowed, key, links, revoked, legacy>>
+    /\ UNCHANGED <<allowed, key, links, revoked, legacy, revokedBy, revokeLog>>
 
 Leave(d) ==
     /\ d \in admitted
     /\ admitted' = admitted \ {d}
-    /\ UNCHANGED <<allowed, key, links, revoked, legacy>>
+    /\ UNCHANGED <<allowed, key, links, revoked, legacy, revokedBy, revokeLog>>
 
 \* The member revokes the device: sticky, and the device is evicted in the SAME step
 \* (one admission cycle, US-8.1 AC2).
@@ -123,6 +135,8 @@ Revoke(d) ==
     /\ revoked' = revoked \cup {d}
     /\ admitted' = admitted \ {d}
     /\ legacy' = legacy \ MemberOf(d)
+    /\ revokedBy' = revokedBy \cup (links \cap ({d} \X Members))
+    /\ revokeLog' = revokeLog \cup (links \cap ({d} \X Members))
     /\ UNCHANGED <<allowed, key, links>>
 
 \* Roster change: recompute the allowed members and evict every device whose member left.
@@ -130,7 +144,7 @@ Reconcile(na) ==
     /\ allowed' = na
     /\ admitted' = {d \in admitted : \E m \in na : <<d, m>> \in links}
     /\ legacy' = legacy \cap na
-    /\ UNCHANGED <<key, links, revoked>>
+    /\ UNCHANGED <<key, links, revoked, revokedBy, revokeLog>>
 
 \* A machine meshes as member m's comms identity. Any machine holding the wallet can do this,
 \* including one whose device key was revoked; only the gate decides.
@@ -138,12 +152,21 @@ LegacyAdmit(m) ==
     /\ m \in LegacyAllowed
     /\ m \notin legacy
     /\ legacy' = legacy \cup {m}
-    /\ UNCHANGED <<allowed, key, links, revoked, admitted>>
+    /\ UNCHANGED <<allowed, key, links, revoked, admitted, revokedBy, revokeLog>>
 
 LegacyLeave(m) ==
     /\ m \in legacy
     /\ legacy' = legacy \ {m}
-    /\ UNCHANGED <<allowed, key, links, revoked, admitted>>
+    /\ UNCHANGED <<allowed, key, links, revoked, admitted, revokedBy, revokeLog>>
+
+\* The client's next roster update no longer carries d's link, without revoking it (cluster-daemon:
+\* "the links sent here REPLACE the previous set"). The device leaves the mesh in the same step. Its
+\* member's comms identity is NOT evicted here: whether it may come back is the gate's call.
+DropLink(d) ==
+    /\ links \cap ({d} \X Members) # {}
+    /\ links' = links \ ({d} \X Members)
+    /\ admitted' = admitted \ {d}
+    /\ UNCHANGED <<allowed, key, revoked, legacy, revokedBy, revokeLog>>
 
 Next ==
     \/ \E d \in Devices : MintKey(d)
@@ -154,6 +177,7 @@ Next ==
     \/ \E na \in SUBSET Members : Reconcile(na)
     \/ \E m \in Members : LegacyAdmit(m)
     \/ \E m \in Members : LegacyLeave(m)
+    \/ \E d \in Devices : DropLink(d)
 
 Spec == Init /\ [][Next]_vars
 
@@ -183,8 +207,11 @@ LegacyOnlyWithoutDevices == \A m \in legacy : ~OnDeviceKeys(m)
 
 \* ADR-003 (the finding, stated directly): once a member revoked a device, no machine is meshed
 \* as that member's comms identity, so the revoked machine cannot come back that way.
+\* Stated over a history variable rather than the gate's own bookkeeping (revokedBy), so it still
+\* bites after the revoked link is no longer sent by the client (DropLink) and when a revocation
+\* never reaches the gate's state.
 RevokedMachineNotBackAsMember ==
-    \A m \in legacy : \A d \in revoked : <<d, m>> \notin links
+    \A m \in legacy : \A d \in Devices : <<d, m>> \notin revokeLog
 
 \* Comms identities, like devices, are only meshed while the roster allows their member.
 LegacySubsetAllowed == legacy \subseteq allowed

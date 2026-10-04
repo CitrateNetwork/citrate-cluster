@@ -40,13 +40,27 @@ did not model the comms identity, so this rule was not covered by its invariants
 
 * `formal/DeviceLink.tla` now models the comms identity (`legacy`, `LegacyAdmit`, `LegacyLeave`,
   eviction on `IssueLink`, `Revoke` and `Reconcile`) with three new invariants:
-  `LegacyOnlyWithoutDevices`, `RevokedMachineNotBackAsMember`, `LegacySubsetAllowed`. TLC
-  (2 members x 3 devices x 3 keys): 10,404 distinct states, no error, all nine invariants.
-  Mutation check, each caught by TLC: admitting the comms identity of any allowed member
-  (`LegacyOnlyWithoutDevices`), not evicting it when a link is issued (`LegacyOnlyWithoutDevices`),
-  counting only unrevoked links (`RevokedMachineNotBackAsMember`), keeping it after a roster change
-  (`LegacySubsetAllowed`).
-* `cluster-core` `device_tests`: six new tests (red before the change). Mutation check: dropping the
+  `LegacyOnlyWithoutDevices`, `RevokedMachineNotBackAsMember`, `LegacySubsetAllowed`.
+* Review pass (2026-10-04): the first version of the model kept every link forever, while
+  cluster-daemon REPLACES the link set on each roster update and only revocations are sticky. The
+  model now has `DropLink(d)` (the client stops sending a link without revoking it), the gate's
+  sticky `revokedBy` pairs (as in `DeviceRegistry.revoked`), and `RevokedMachineNotBackAsMember`
+  is stated over a history variable (`revokeLog`) that no action reads. TLC (2 members x 3 devices
+  x 3 keys): 21,456 distinct states, no error, all nine invariants. Mutation check, each caught by
+  TLC: admitting the comms identity of any allowed member (`LegacyOnlyWithoutDevices`), not
+  evicting it when a link is issued (`LegacyOnlyWithoutDevices`), the gate ignoring revocations
+  (`RevokedMachineNotBackAsMember`; the earlier model could not catch this one, because links never
+  left it), a revocation not recorded by the gate (`RevokedMachineNotBackAsMember`), keeping it
+  after a roster change (`LegacySubsetAllowed`), and a withdrawn link leaving its device meshed
+  (`NoActWithoutLink`).
+* Withdrawing a link is not a revocation: a member that never revoked anything and whose links the
+  client stops sending is back on its comms identity. A member that revoked a device stays on
+  device keys for the life of the daemon process. citrate-core keeps its links and revocations in
+  a local store and sends them with every roster update, so this survives a daemon restart. Each
+  node only knows the links and revocations its own core sends it; distributing them to the other
+  members' nodes is citrate-core work (S8.1 follow-up), not a cluster change.
+* `cluster-core` `device_tests`: eight new tests (six red before the change; two added in the
+  review for the replaced-links case). Mutation check: dropping the
   revocation seed fails one test, removing the filter fails five.
 * `cluster-daemon` `device_daemon_tests`: two new tests with real secp256k1 links, one of them a
   member that revoked both machines and then presents its comms identity.
