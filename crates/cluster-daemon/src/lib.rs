@@ -1,5 +1,9 @@
 //! citrate-cluster daemon — the library.
 //!
+//! HUP-S8.4: one daemon process serves every group the device belongs to. Each group has its own
+//! session, its own admission state and (on the libp2p path) its own swarm, built on demand by a
+//! per-group transport factory; nothing a request does to one group touches another.
+//!
 //! Owns one [`cluster_core::ClusterSession`] per group (the admission gate + the transport), and maps
 //! the loopback JSON IPC ([`ipc`]) onto it. The daemon never re-derives group membership — the client
 //! feeds the roster (which comes from the comms daemon) via `SetRoster`, and the daemon reconciles
@@ -31,6 +35,16 @@ pub const MAX_SHARED_FILES: usize = 4096;
 
 /// PBA-L6b-020: the largest page `SharedFiles` returns in one response.
 pub const MAX_SHARED_FILES_PAGE: usize = 1024;
+
+/// HUP-S8.4: the most groups one daemon serves at once. On the libp2p path each group is a swarm
+/// with its own listen port, so this bounds the sockets and tasks a client can make the daemon
+/// open. PENDING OWNER SIGN-OFF.
+pub const MAX_GROUPS: usize = 32;
+
+/// HUP-S8.4: builds a group's transport. Takes the group id (the libp2p factory derives the topic,
+/// Noise prologue and listen port from it) and may fail (a port, a runtime); the failure becomes the
+/// request's error and no session is created.
+pub type TransportFactory<T> = Box<dyn Fn(&str) -> Result<T, String> + Send>;
 
 /// CL-B-007: refuse to read a secret file (the seed, the bearer) unless it is `0600` and owned by the
 /// daemon's own uid. A packaging bug, a `umask 0` service manager, or a client that writes the file
@@ -129,14 +143,12 @@ pub struct ClusterDaemon<T: MeshTransport> {
     /// This node's canonical member address (its comms/cluster identity — the gossipsub sender).
     self_address: String,
     /// Factory for a fresh per-group transport (the libp2p impl opens a swarm per group topic).
-    make_transport: fn() -> T,
+    make_transport: TransportFactory<T>,
     /// CL-B-002: when `Some(g)`, this daemon is pinned to the single group `g` and REFUSES every
-    /// other group id. The libp2p transport factory (`fn() -> T`) carries no group id, so a second
-    /// group would silently build another swarm bound to the SAME env-configured topic, port and
-    /// PeerId while judging peers against a different roster — a silent mesh mis-wiring. The daemon
-    /// is documented "one group per daemon in S1"; this enforces that constraint fail-closed rather
-    /// than relying on the client to honour it. `None` for the single-node in-process transport,
-    /// which has no wire and no such constraint.
+    /// other group id. Originally the libp2p factory carried no group id, so a second group would
+    /// have built another swarm on the SAME topic, port and PeerId. HUP-S8.4 fixed the cause (the
+    /// factory now receives the group id and derives topic, Noise prologue and port from it), so
+    /// the pin is only the operator's choice (`CITRATE_CLUSTER_GROUP`). `None`: every group.
     single_group: Option<String>,
     groups: HashMap<String, ClusterSession<T>>,
     /// Per-group co-pinned shared file set: this node's `ShareFile` announcements plus every CID
@@ -156,7 +168,22 @@ struct GroupDevices {
 }
 
 impl<T: MeshTransport> ClusterDaemon<T> {
-    pub fn new(self_address: impl Into<String>, make_transport: fn() -> T) -> Self {
+    pub fn new(self_address: impl Into<String>, make_transport: fn() -> T) -> Self
+    where
+        T: 'static,
+    {
+        Self::with_factory(
+            self_address,
+            Box::new(move |_group: &str| Ok(make_transport())),
+        )
+    }
+
+    /// HUP-S8.4: a daemon whose transport factory is told the group id and may fail. `main.rs` uses
+    /// this with the libp2p factory, so one process serves every group (one swarm each).
+    pub fn with_factory(
+        self_address: impl Into<String>,
+        make_transport: TransportFactory<T>,
+    ) -> Self {
         ClusterDaemon {
             self_address: cluster_core::canonical_address(&self_address.into()).unwrap_or_default(),
             make_transport,
@@ -175,11 +202,34 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         self_address: impl Into<String>,
         make_transport: fn() -> T,
         group: impl Into<String>,
-    ) -> Self {
+    ) -> Self
+    where
+        T: 'static,
+    {
         ClusterDaemon {
             single_group: Some(group.into()),
             ..Self::new(self_address, make_transport)
         }
+    }
+
+    /// HUP-S8.4: [`with_factory`](Self::with_factory) pinned to one group (`CITRATE_CLUSTER_GROUP`
+    /// set: the pre-HUP-S8.4 operator mode, unchanged).
+    pub fn with_factory_single_group(
+        self_address: impl Into<String>,
+        make_transport: TransportFactory<T>,
+        group: impl Into<String>,
+    ) -> Self {
+        ClusterDaemon {
+            single_group: Some(group.into()),
+            ..Self::with_factory(self_address, make_transport)
+        }
+    }
+
+    /// The groups this daemon currently has a session for (sorted).
+    pub fn groups(&self) -> Vec<String> {
+        let mut g: Vec<String> = self.groups.keys().cloned().collect();
+        g.sort();
+        g
     }
 
     /// Fail closed if `group` is not the daemon's pinned single group (CL-B-002). A no-op when the
@@ -230,11 +280,27 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         messages
     }
 
-    fn ensure_session(&mut self, group: &str) -> &mut ClusterSession<T> {
-        let make = self.make_transport;
+    /// The group's session, creating it (and its transport) on first use. Fails, creating nothing,
+    /// when the group id is empty, the daemon already serves [`MAX_GROUPS`] groups, or the transport
+    /// cannot start.
+    fn ensure_session(&mut self, group: &str) -> Result<&mut ClusterSession<T>, String> {
+        if !self.groups.contains_key(group) {
+            if group.trim().is_empty() {
+                return Err("empty group id".to_string());
+            }
+            if self.groups.len() >= MAX_GROUPS {
+                return Err(format!(
+                    "this daemon already serves {MAX_GROUPS} groups; leave one first"
+                ));
+            }
+            let transport = (self.make_transport)(group)
+                .map_err(|e| format!("starting the mesh for group {group:?}: {e}"))?;
+            self.groups
+                .insert(group.to_string(), ClusterSession::new(&[], transport));
+        }
         self.groups
-            .entry(group.to_string())
-            .or_insert_with(|| ClusterSession::new(&[], make()))
+            .get_mut(group)
+            .ok_or_else(|| format!("group {group:?} has no session"))
     }
 
     /// Set/update a group's roster: reconcile the mesh (recompute the allowed set + evict every
@@ -273,6 +339,8 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         revocations: &[RevocationWire],
     ) -> Result<(Vec<String>, Vec<String>), String> {
         self.ensure_group_allowed(group)?;
+        // Create the session (and its transport) first, so a refused group records no device state.
+        self.ensure_session(group)?;
         let links: Vec<_> = links.iter().map(Into::into).collect();
         let revocations: Vec<_> = revocations.iter().map(Into::into).collect();
         let state = self.device_state.entry(group.to_string()).or_default();
@@ -295,7 +363,7 @@ impl<T: MeshTransport> ClusterDaemon<T> {
         group: &str,
         roster: &[(String, String)],
     ) -> Result<Vec<String>, String> {
-        let session = self.ensure_session(group);
+        let session = self.ensure_session(group)?;
         let before: BTreeSet<String> = session.membership().allowed().into_iter().collect();
         let evicted = session.reconcile(roster);
         let allowed = session.membership().allowed();
@@ -313,8 +381,37 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// for now it ensures the group's session exists so subsequent ops address it.
     pub fn join(&mut self, group: &str) -> Result<(), String> {
         self.ensure_group_allowed(group)?;
-        self.ensure_session(group);
+        self.ensure_session(group)?;
         Ok(())
+    }
+
+    /// HUP-S8.4: this node's group seed (link/QR text) for a joined group: the group id plus the
+    /// addresses another machine can dial. Unknown group, or a transport with no network → `Err`.
+    pub fn seed(&self, group: &str) -> Result<(String, Vec<String>), String> {
+        let Some(s) = self.groups.get(group) else {
+            return Err(format!("not in group {group}"));
+        };
+        let addrs = s.transport().seed_addrs()?;
+        if addrs.is_empty() {
+            return Err("no shareable listen address yet; try again in a moment".to_string());
+        }
+        let seed =
+            cluster_core::seed::GroupSeed::new(group, addrs.clone()).map_err(|e| e.to_string())?;
+        Ok((seed.encode(), addrs))
+    }
+
+    /// HUP-S8.4: dial the peers a group seed names. The seed must be for `group`, and the group must
+    /// be joined. Returns how many addresses will be dialed. Admission is unchanged: each peer is let
+    /// in only at identify, against this group's roster and DeviceLinks.
+    pub fn add_seed(&mut self, group: &str, seed_text: &str) -> Result<usize, String> {
+        let seed = cluster_core::seed::GroupSeed::decode(seed_text).map_err(|e| e.to_string())?;
+        if seed.group != group {
+            return Err("the seed is for a different group".to_string());
+        }
+        let Some(s) = self.groups.get_mut(group) else {
+            return Err(format!("not in group {group}"));
+        };
+        s.transport_mut().add_peers(&seed.addrs)
     }
 
     /// This node leaves the group's mesh (drop the session; the transport tears down on drop). Also
@@ -450,7 +547,13 @@ impl<T: MeshTransport> ClusterDaemon<T> {
     /// A peer connected (the transport dialed/accepted it). Admit IFF cluster-core allows it (in the
     /// role-gated roster). Returns whether admitted — the transport drops the connection on `false`.
     pub fn admit_peer(&mut self, group: &str, address: &str, role: &str) -> bool {
-        self.ensure_session(group).join(address, role)
+        if self.ensure_group_allowed(group).is_err() {
+            return false;
+        }
+        match self.ensure_session(group) {
+            Ok(s) => s.join(address, role),
+            Err(_) => false,
+        }
     }
 
     /// A peer disconnected.
@@ -470,3 +573,5 @@ impl<T: MeshTransport> ClusterDaemon<T> {
 mod daemon_tests;
 #[cfg(test)]
 mod device_daemon_tests;
+#[cfg(test)]
+mod multigroup_tests;

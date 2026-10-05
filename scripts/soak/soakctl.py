@@ -11,6 +11,18 @@ Usage:
   soakctl.py <socket> <bearer-file> status     <group>
   soakctl.py <socket> <bearer-file> peers      <group>
   soakctl.py <socket> <bearer-file> share      <group> <cid>
+  soakctl.py <socket> <bearer-file> set-roster-json <group> <roster.json> [<links.json> [<revocations.json>]]
+  soakctl.py <socket> <bearer-file> devices    <group>
+  soakctl.py <socket> <bearer-file> seed       <group>
+  soakctl.py <socket> <bearer-file> add-seed   <group> <seed-text>
+
+set-roster-json (HUP-S8.1 DeviceLink soak) reads the roster ([[address, role], ...]), the signed
+device links and the signed revocations from JSON files, as written by the cluster-daemon example
+`devicelink_fixture`; `devices` lists each member's linked devices with live state.
+
+seed / add-seed (HUP-S8.4 mesh prerequisites): `seed` prints this node's group link
+(citrate-cluster://seed?...), the text a member shares as a link or QR code; `add-seed` dials the
+machines a link names. A link carries locations only; admission is unchanged.
 
 Prints the daemon's JSON response to stdout; exits 0 on an ok/typed response, 1 on an error response
 or transport failure.
@@ -18,6 +30,11 @@ or transport failure.
 import json
 import socket
 import sys
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
 
 
 def build_request(op, args):
@@ -35,6 +52,20 @@ def build_request(op, args):
         return {"op": "peers", "group": args[0]}
     if op == "share":
         return {"op": "shareFile", "group": args[0], "cid": args[1]}
+    if op == "set-roster-json":
+        group = args[0]
+        req = {"op": "setRoster", "group": group, "roster": read_json(args[1])}
+        if len(args) > 2:
+            req["devices"] = read_json(args[2])
+        if len(args) > 3:
+            req["revocations"] = read_json(args[3])
+        return req
+    if op == "devices":
+        return {"op": "devices", "group": args[0]}
+    if op == "seed":
+        return {"op": "seed", "group": args[0]}
+    if op == "add-seed":
+        return {"op": "addSeed", "group": args[0], "seed": args[1]}
     raise SystemExit(f"unknown op: {op}")
 
 

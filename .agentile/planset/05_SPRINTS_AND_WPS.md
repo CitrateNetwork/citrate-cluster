@@ -106,3 +106,62 @@ over UDS, feeding rosters from the comms daemon, and surfacing `sharedFiles` in 
 `ClusterStatus`. That lives in citrate-core (`cluster.rs`/bridge), tracked as gate2 `g2-wiring`, and is
 a separate change. Multi-group-per-process and re-admit-on-authorization-change (noted under CL-S1
 gaps) remain follow-ons.
+
+## HUP-S8.4 prep (2026-10-01, branch `hup/n5-fleet-rest`): re-dial, multi-process proofs, soak kit
+
+Toward CL-S3/CL-S4; nothing here flips a gate.
+
+- **Re-admit after authorization (the CL-S1 gap above).** The swarm re-dials its bootstrap peers
+  that are not connected every 5 s (at most 16 per tick, 64 kept; requested dials are kept too).
+  A peer refused at `identify` because it was not yet authorized gets in on the next re-dial once a
+  roster or DeviceLink update authorizes it, without a restart. Admission is still decided only at
+  `identify`, so `connected ⊆ admitted ⊆ allowed` is unchanged. Red-green:
+  `a_peer_refused_before_authorization_gets_in_after_it_is_authorized` failed before the timer.
+- **Multi-process proofs on one machine** (`tests/fleet_multiprocess.rs`): another member's device
+  admitted when its link arrives late (no restart; mutation-checked by stretching the re-dial to an
+  hour, which fails it), and a three-device, two-member full mesh where a revocation evicts one
+  device from both nodes that apply it while its re-dials stay refused.
+- **Single-machine ladder control** (`tests/ladder_multiprocess.rs`): N processes, one member and
+  device each, full mesh, one co-pin to all. N = 4 runs in the suite; N = 16, 32, 50 ran green on an
+  Apple M-series Mac (numbers in `scripts/soak/DEVICELINK_MULTI_MACHINE.md`). Honest limits: no
+  peer discovery (every node bootstraps to every node), and 64 incoming connections per node put
+  the full-mesh ceiling near 65 nodes. The real ladder (separate machines, 50 to 2000) is still CL-S3.
+- **Soak kit for the DGX team:** `examples/devicelink_fixture.rs` (fresh test keys only; member and
+  wallet secrets never written), `scripts/soak/devicelink-node.sh`, `soakctl.py set-roster-json` and
+  `devices`, runbook `scripts/soak/DEVICELINK_MULTI_MACHINE.md` (two- and three-machine steps).
+  Dry-run on one Mac over loopback: both flows PASS.
+
+Workspace tests 104 to 109 (+1 ignored ladder step).
+
+## HUP-S8.4 mesh prerequisites (2026-10-04, branch `hup/n7-cluster-mesh-prereqs`)
+
+The two "Not done" preconditions for mesh-on-by-default from the fleet PR: peer discovery, and one
+daemon serving every group. Nothing here flips the mesh default or records the CL-S4 sign-off.
+
+- **One daemon, every group.** The transport factory now receives the group id (`TransportFactory`,
+  `ClusterDaemon::with_factory`), so the root cause of CL-B-002 is gone: each group gets its own
+  swarm (topic, Noise prologue and listen port derived from the group) under the one device key, on
+  one shared tokio runtime (`Libp2pFactory`). Without `CITRATE_CLUSTER_GROUP` a daemon serves every
+  group its client joins (cap `MAX_GROUPS` = 32); with it, the daemon is pinned exactly as before.
+  Per-group ports: a fixed base `P` gives `P + keccak256(group) mod 1024` (stable across restarts,
+  ephemeral on collision); base 0 stays ephemeral.
+- **Seeded bootstrap (link/QR).** `cluster_core::seed::GroupSeed` (pure, bounded):
+  `citrate-cluster://seed?v=1&g=<group>&a=<multiaddr>...`, up to 8 addresses that each name a peer.
+  IPC `seed` / `addSeed`; a seed is locations only, so admission is still decided at `identify`.
+- **mDNS discovery, opt-in twice.** Cargo feature `mdns` (off in default and release builds) and
+  `CITRATE_CLUSTER_MDNS=1` at run time; a default build refuses the flag at start-up. A discovered
+  peer is dialed only if its PeerId resolves to an address the group authorizes, and re-dialed while
+  it stays discovered and authorized (bounded: 256 peers, 8 addresses each, 16 dials per tick).
+- **Re-dial fix (found by this work).** Re-dials reused the listen port as their source, so a peer
+  that had just been refused could never get back in from a Mac (`EADDRINUSE` on the TIME_WAIT
+  4-tuple; libp2p only falls back on the Linux error). The late-link fleet test failed on the
+  unchanged base on macOS; re-dials now take a new port and it passes reliably.
+- **Proofs.** Unit: seed format (9), per-group swarms with isolated admission on one runtime, seed
+  addresses, discovery bounds, the multi-group daemon rules (8). Multi-process
+  (`tests/multigroup_multiprocess.rs`): two daemons x two groups meshed from seeds alone; a
+  revocation in one group evicts there only (the other group stays meshed through 7 s of refused
+  re-dials); stable per-group ports across a restart; a default build refuses mDNS. Ladder: the
+  50-node single-machine control passes in the old bootstrap mode and in the new seed mode.
+  mDNS end to end (feature on, ignored by default because it needs LAN multicast) passes on a Mac.
+
+Workspace tests 121 to 152 (+2 ignored ladder steps; +2 ignored mDNS tests under `--features mdns`).

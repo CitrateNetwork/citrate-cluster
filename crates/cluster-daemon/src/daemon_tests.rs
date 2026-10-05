@@ -269,6 +269,12 @@ impl crate::transport::MeshTransport for RecordingTransport {
     fn authorize(&mut self, addr: &str) {
         AUTHORIZED.with(|a| a.borrow_mut().push(addr.to_string()));
     }
+    fn add_peers(&mut self, _addrs: &[String]) -> Result<usize, String> {
+        Err(crate::transport::NO_MESH.to_string())
+    }
+    fn seed_addrs(&self) -> Result<Vec<String>, String> {
+        Err(crate::transport::NO_MESH.to_string())
+    }
 }
 
 #[test]
