@@ -56,6 +56,11 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// HUP-S8.4: this node's group seed (link/QR text) for a joined group.
+    Seed { group: String },
+    /// HUP-S8.4: dial the peers a group seed names (a seed another member shared). The seed must be
+    /// for `group`. Locations only: admission is still decided at identify.
+    AddSeed { group: String, seed: String },
 }
 
 /// One peer in a status/peers response.
@@ -120,6 +125,15 @@ pub enum Response {
         offset: usize,
         total: usize,
     },
+    /// HUP-S8.4: the answer to [`Request::Seed`]: the link/QR text and the addresses in it.
+    Seed {
+        seed: String,
+        addrs: Vec<String>,
+    },
+    /// HUP-S8.4: the answer to [`Request::AddSeed`]: how many addresses are being dialed.
+    Seeded {
+        dialing: usize,
+    },
     Error {
         message: String,
     },
@@ -182,5 +196,13 @@ pub fn handle_request<T: MeshTransport>(daemon: &mut ClusterDaemon<T>, req: Requ
                 total,
             }
         }
+        Request::Seed { group } => match daemon.seed(&group) {
+            Ok((seed, addrs)) => Response::Seed { seed, addrs },
+            Err(e) => Response::Error { message: e },
+        },
+        Request::AddSeed { group, seed } => match daemon.add_seed(&group, &seed) {
+            Ok(dialing) => Response::Seeded { dialing },
+            Err(e) => Response::Error { message: e },
+        },
     }
 }

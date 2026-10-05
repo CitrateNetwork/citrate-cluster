@@ -24,7 +24,18 @@ pub trait MeshTransport: ClusterTransport {
     /// connect" ordering). The libp2p transport adds it to its authorized set; the single-node
     /// in-process transport has no mesh, so this is a NO-OP (keeps `online` honest — never fabricated).
     fn authorize(&mut self, addr: &str);
+    /// HUP-S8.4: dial peers named by a group seed (link or QR) and keep them for re-dial. Returns how
+    /// many addresses were accepted. A seed carries locations only: every resulting connection is
+    /// still admitted (or dropped) at the identify handshake. A transport with no network refuses.
+    fn add_peers(&mut self, addrs: &[String]) -> Result<usize, String>;
+    /// HUP-S8.4: the addresses another machine can dial this node on for this group, each naming
+    /// this node's peer id (what a group seed carries). A transport with no network refuses.
+    fn seed_addrs(&self) -> Result<Vec<String>, String>;
 }
+
+/// The honest answer of a transport with no cross-machine mesh to a seed request.
+pub const NO_MESH: &str =
+    "this node runs without the cross-machine mesh, so it has no address to share or dial";
 
 /// Single-node / loopback transport. Tracks who is "connected" (so the admission lifecycle + status
 /// are exercisable end to end) and holds an inbox. With no real peers, `publish` has nowhere to fan
@@ -71,5 +82,11 @@ impl MeshTransport for InProcessTransport {
     }
     fn authorize(&mut self, _addr: &str) {
         // Single node: no mesh, nothing to authorize. `online` stays 0 (honest).
+    }
+    fn add_peers(&mut self, _addrs: &[String]) -> Result<usize, String> {
+        Err(NO_MESH.to_string())
+    }
+    fn seed_addrs(&self) -> Result<Vec<String>, String> {
+        Err(NO_MESH.to_string())
     }
 }

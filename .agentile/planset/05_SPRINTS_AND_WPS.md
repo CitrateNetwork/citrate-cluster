@@ -132,3 +132,36 @@ Toward CL-S3/CL-S4; nothing here flips a gate.
   Dry-run on one Mac over loopback: both flows PASS.
 
 Workspace tests 104 to 109 (+1 ignored ladder step).
+
+## HUP-S8.4 mesh prerequisites (2026-10-04, branch `hup/n7-cluster-mesh-prereqs`)
+
+The two "Not done" preconditions for mesh-on-by-default from the fleet PR: peer discovery, and one
+daemon serving every group. Nothing here flips the mesh default or records the CL-S4 sign-off.
+
+- **One daemon, every group.** The transport factory now receives the group id (`TransportFactory`,
+  `ClusterDaemon::with_factory`), so the root cause of CL-B-002 is gone: each group gets its own
+  swarm (topic, Noise prologue and listen port derived from the group) under the one device key, on
+  one shared tokio runtime (`Libp2pFactory`). Without `CITRATE_CLUSTER_GROUP` a daemon serves every
+  group its client joins (cap `MAX_GROUPS` = 32); with it, the daemon is pinned exactly as before.
+  Per-group ports: a fixed base `P` gives `P + keccak256(group) mod 1024` (stable across restarts,
+  ephemeral on collision); base 0 stays ephemeral.
+- **Seeded bootstrap (link/QR).** `cluster_core::seed::GroupSeed` (pure, bounded):
+  `citrate-cluster://seed?v=1&g=<group>&a=<multiaddr>...`, up to 8 addresses that each name a peer.
+  IPC `seed` / `addSeed`; a seed is locations only, so admission is still decided at `identify`.
+- **mDNS discovery, opt-in twice.** Cargo feature `mdns` (off in default and release builds) and
+  `CITRATE_CLUSTER_MDNS=1` at run time; a default build refuses the flag at start-up. A discovered
+  peer is dialed only if its PeerId resolves to an address the group authorizes, and re-dialed while
+  it stays discovered and authorized (bounded: 256 peers, 8 addresses each, 16 dials per tick).
+- **Re-dial fix (found by this work).** Re-dials reused the listen port as their source, so a peer
+  that had just been refused could never get back in from a Mac (`EADDRINUSE` on the TIME_WAIT
+  4-tuple; libp2p only falls back on the Linux error). The late-link fleet test failed on the
+  unchanged base on macOS; re-dials now take a new port and it passes reliably.
+- **Proofs.** Unit: seed format (9), per-group swarms with isolated admission on one runtime, seed
+  addresses, discovery bounds, the multi-group daemon rules (8). Multi-process
+  (`tests/multigroup_multiprocess.rs`): two daemons x two groups meshed from seeds alone; a
+  revocation in one group evicts there only (the other group stays meshed through 7 s of refused
+  re-dials); stable per-group ports across a restart; a default build refuses mDNS. Ladder: the
+  50-node single-machine control passes in the old bootstrap mode and in the new seed mode.
+  mDNS end to end (feature on, ignored by default because it needs LAN multicast) passes on a Mac.
+
+Workspace tests 121 to 152 (+2 ignored ladder steps; +2 ignored mDNS tests under `--features mdns`).

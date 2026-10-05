@@ -48,12 +48,15 @@ ceremony (audited with core), NAT traversal and peer discovery (not built).
 
 ## Known limits (accepted or to be decided)
 
-* **No discovery.** Peers come only from bootstrap addresses, so every node must bootstrap to every
-  other node for a full mesh. With 64 incoming connections per node the full-mesh ceiling is about
-  65 nodes. Single-machine ladder control: 50 nodes meshed and one co-pin reached all of them
+* **Discovery is local or hand-carried.** Peers come from bootstrap addresses, group seeds (link or
+  QR, HUP-S8.4) or, when built and switched on, mDNS on the local network. There is no DHT or NAT
+  traversal, so a full mesh still needs every pair to be reachable. With 64 incoming connections per
+  node the full-mesh ceiling is about 65 nodes. Single-machine ladder control: 50 nodes meshed and
+  one co-pin reached all of them, in bootstrap mode and in seed mode
   (`tests/ladder_multiprocess.rs`, numbers in `scripts/soak/DEVICELINK_MULTI_MACHINE.md`).
-* **One group per daemon process** in libp2p mode (`CITRATE_CLUSTER_GROUP`). citrate-core keeps the
-  mesh-on-by-default branch closed until this changes (`MULTI_GROUP_DAEMON`).
+* **One daemon serves every group** (HUP-S8.4, one swarm per group). citrate-core keeps the
+  mesh-on-by-default branch closed (`MULTI_GROUP_DAEMON = false`) until this is merged and the
+  bundled daemon is rebuilt from it, and until this packet is signed.
 * **Relayed sources are dropped:** a message is accepted only from a directly identified publisher.
 * **Re-dial cost:** a refused peer costs one Noise handshake per 5 s against each bootstrap address.
 * **Removal is not a lock-out** for a machine that still holds the member's wallet (it can link a new
@@ -81,3 +84,22 @@ ceremony (audited with core), NAT traversal and peer discovery (not built).
 |---|---|---|---|---|
 | Security lead | | | | |
 | Owner | | | | |
+
+## HUP-S8.4 mesh prerequisites (2026-10-04, branch `hup/n7-cluster-mesh-prereqs`): new surface to review
+
+Added after the draft above; review these with it. Nothing here is signed or switched on by default.
+
+* **Multi-group daemon.** One swarm per group under the same device key: separate authorized and
+  connected sets, the group id as the Noise prologue (a handshake between two groups' swarms fails),
+  and a port per group (`base + keccak(group) mod 1024`). Opening the mesh therefore opens up to
+  `MAX_GROUPS` (32) listening ports in a 1024-port range above the base; firewall guidance must say so.
+* **Group seeds.** Link/QR text with up to 8 multiaddrs. Locations only: a seed cannot authorize a
+  peer, and a forged seed costs one failed dial. Parsing is bounded (2 KiB, 8 addresses, 256-byte
+  fields) and all-or-nothing.
+* **mDNS (cargo feature `mdns`, off in default and release builds).** When built in AND switched on,
+  the device announces its PeerId (which encodes its device key, so its address) on the local
+  network, per group swarm. Discovery never admits. The feature compiles libp2p's mDNS stack, whose
+  DNS-message dependency carries open lockfile advisories (see "Dependencies" above); it must not ship
+  until patched versions exist or the security lead accepts them in writing.
+* **Re-dial from a new source port.** Fixes re-admission from macOS after a refusal (TIME_WAIT).
+  Each re-dial is a fresh TCP connection; the per-tick and per-list caps are unchanged.

@@ -27,6 +27,7 @@ fn libp2p_config_zeroizes_secret_on_drop() {
             .expect("static multiaddr parses"),
         group_id: "cl-b-001-test".to_string(),
         bootstrap: Vec::new(),
+        mdns: false,
     });
 
     // Address of the secret field, captured before the destructor runs.
