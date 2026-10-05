@@ -106,7 +106,7 @@ Record: the three PeerIds, revoke-to-drop time on each side, and whether any re-
 Same fixture as above; every machine runs ONE daemon for two groups with
 `scripts/soak/multigroup-node.sh` (no `CITRATE_CLUSTER_GROUP`). Each group listens on its own
 port, `PORT + keccak(group) mod 1024`; the script prints them. Open that range inbound (Linux:
-`sudo ufw allow 4211:5235/tcp`), or at least the printed ports.
+`sudo ufw allow 4211:5234/tcp`, base 4211 plus at most 1023), or at least the printed ports.
 
 ### 4a. Two machines, two groups, from group links only
 

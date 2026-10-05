@@ -308,3 +308,26 @@ fn mdns_finds_an_authorized_peer_on_the_lan_without_a_seed() {
     assert!(!a.connected().contains(&xc) && !b.connected().contains(&xc));
     assert!(c.connected().is_empty(), "discovery never admits");
 }
+
+/// HUP-S8.4 review: every re-dial takes a NEW local port. A re-dial from the listen port recreates
+/// the 4-tuple of a connection this node just closed; macOS refuses it with EADDRINUSE while that
+/// tuple sits in TIME_WAIT, so a peer refused once could never get back in from a Mac. The
+/// multi-process late-link test only catches this when the timing lines up, so pin it here.
+/// `DialOpts` exposes its port policy only through `Debug` (libp2p-swarm, pinned by Cargo.lock).
+#[test]
+fn every_redial_allocates_a_new_local_port() {
+    let peer = peer_of(0x73);
+    for addr in [
+        format!("/ip4/10.0.0.3/tcp/4211/p2p/{peer}"),
+        "/ip4/10.0.0.3/tcp/4211".to_string(),
+    ] {
+        let ma: Multiaddr = addr.parse().expect("multiaddr");
+        let opts = format!("{:?}", redial_opts(ma));
+        assert!(opts.contains("port_use: New"), "{addr}: {opts}");
+    }
+    // The peer id a bootstrap address names is kept, so the dial is checked against it.
+    let named: Multiaddr = format!("/ip4/10.0.0.3/tcp/4211/p2p/{peer}")
+        .parse()
+        .expect("multiaddr");
+    assert_eq!(redial_opts(named).get_peer_id(), Some(peer));
+}
