@@ -19,7 +19,9 @@
 //!                                Noise/peer identity is bound to this key. HUP-S8.1: this is the
 //!                                DEVICE key (random per machine, linked to the member by a signed
 //!                                DeviceLink), so the PeerId is per device; a client without a
-//!                                link still passes its comms key (legacy single-device identity).
+//!                                link still passes its comms key (legacy single-device identity),
+//!                                which the mesh admits only until the member links or revokes a
+//!                                device (ADR-003).
 //!                                Never the wallet key. The secret NEVER crosses argv/env (they
 //!                                leak to `ps`), only a file.
 //!   CITRATE_CLUSTER_GROUP        the group id == the gossipsub topic (one group per daemon in S1)
@@ -67,9 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("bearer file is empty (fail closed)".into());
     }
     let self_addr = required("CITRATE_CLUSTER_SELF_ADDR")?;
-    if cluster_core::canonical_address(&self_addr).is_none() {
+    let Some(self_canonical) = cluster_core::canonical_address(&self_addr) else {
         return Err("CITRATE_CLUSTER_SELF_ADDR is not a 20-byte hex address".into());
-    }
+    };
 
     // Transport selection: real libp2p mesh when a listen addr is configured, else single-node
     // in-process. Both slot behind the same MeshTransport seam — the daemon logic is identical.
@@ -87,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (derived_addr, _) = Libp2pTransport::identity_from_secret(cfg.secret)
             .map_err(|e| format!("deriving identity from the seed: {e}"))?;
         drop(cfg);
-        let want = cluster_core::canonical_address(&self_addr).expect("SELF_ADDR validated above");
+        let want = self_canonical;
         if derived_addr != want {
             return Err(format!(
                 "CITRATE_CLUSTER_SELF_ADDR ({want}) does not match the address derived from the seed file ({derived_addr}) — fail closed"
