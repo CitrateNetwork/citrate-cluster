@@ -32,6 +32,7 @@ fn transport(seed: u8, group: &str) -> Libp2pTransport {
         listen: "/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"),
         group_id: group.into(),
         bootstrap: vec![],
+        mdns: false,
     })
     .expect("transport starts")
 }

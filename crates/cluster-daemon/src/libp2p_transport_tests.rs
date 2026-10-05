@@ -28,6 +28,7 @@ fn transport(seed: u8, group: &str, bootstrap: Vec<Multiaddr>) -> Libp2pTranspor
         listen: loopback(),
         group_id: group.to_string(),
         bootstrap,
+        mdns: false,
     })
     .expect("transport starts")
 }

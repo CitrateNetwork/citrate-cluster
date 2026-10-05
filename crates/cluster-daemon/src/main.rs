@@ -24,15 +24,23 @@
 //!                                device (ADR-003).
 //!                                Never the wallet key. The secret NEVER crosses argv/env (they
 //!                                leak to `ps`), only a file.
-//!   CITRATE_CLUSTER_GROUP        the group id == the gossipsub topic (one group per daemon in S1)
-//!   CITRATE_CLUSTER_BOOTSTRAP    optional comma-separated peer multiaddrs to dial on startup
+//!   CITRATE_CLUSTER_GROUP        optional: pin the daemon to this one group (the pre-HUP-S8.4 mode).
+//!                                Unset: HUP-S8.4, one daemon serves every group the client joins,
+//!                                one swarm per group (its own topic, Noise prologue and port).
+//!   CITRATE_CLUSTER_BOOTSTRAP    optional comma-separated peer multiaddrs to dial on startup (the
+//!                                pinned group only; other groups take peers from group seeds)
+//!   CITRATE_CLUSTER_MDNS         optional `1`: LAN discovery for every group (off by default)
+//!
+//! Per-group listen ports (multi-group mode): a fixed base port P gives each group
+//! `P + keccak256(group) mod 1024`, falling back to an ephemeral port when taken; base port 0 stays
+//! ephemeral.
 
 use std::env;
 use std::path::PathBuf;
 
-use cluster_daemon::libp2p_transport::Libp2pTransport;
+use cluster_daemon::libp2p_transport::{Libp2pFactory, Libp2pTransport, NodeConfig};
 use cluster_daemon::transport::InProcessTransport;
-use cluster_daemon::{server, ClusterDaemon};
+use cluster_daemon::{server, ClusterDaemon, TransportFactory};
 use zeroize::{Zeroize, Zeroizing};
 
 fn required(key: &str) -> Result<String, String> {
@@ -76,19 +84,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Transport selection: real libp2p mesh when a listen addr is configured, else single-node
     // in-process. Both slot behind the same MeshTransport seam — the daemon logic is identical.
     if env::var("CITRATE_CLUSTER_LISTEN").is_ok() {
-        // Pre-validate the libp2p env here so the lazy per-group factory's `expect` never fires on
-        // bad config — fail closed at startup with a clear message instead. (Also stats the 0600 seed
-        // file per CL-B-007.)
-        let cfg = Libp2pTransport::config_from_env()
-            .map_err(|e| format!("libp2p transport config: {e}"))?;
-        let group = cfg.group_id.clone();
+        // Validate the libp2p env at startup (fail closed with a clear message). Also opens the 0600
+        // seed file per CL-B-007; the secret is wiped when the factory drops (CL-B-001).
+        let node = NodeConfig::from_env().map_err(|e| format!("libp2p transport config: {e}"))?;
         // CL-B-007: the identity the daemon advertises (SELF_ADDR) must equal the identity derived
         // from the seed file, or the node reports one address locally while presenting another on the
-        // wire. `identity_from_secret` takes the secret by value and zeroizes its copy; `cfg` wipes
-        // the original on drop (CL-B-001).
-        let (derived_addr, _) = Libp2pTransport::identity_from_secret(cfg.secret)
+        // wire.
+        let (derived_addr, _) = node
+            .identity()
             .map_err(|e| format!("deriving identity from the seed: {e}"))?;
-        drop(cfg);
         let want = self_canonical;
         if derived_addr != want {
             return Err(format!(
@@ -96,9 +100,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        // CL-B-002: pin the daemon to the single configured group — a second group id is refused
-        // rather than silently built on the same env topic/port/PeerId.
-        let daemon = ClusterDaemon::new_single_group(self_addr, Libp2pTransport::from_env, group);
+        let pinned = node.pinned_group.clone();
+        let factory = Libp2pFactory::new(node).map_err(|e| format!("libp2p runtime: {e}"))?;
+        let make: TransportFactory<Libp2pTransport> =
+            Box::new(move |group: &str| factory.transport_for(group));
+        let daemon = match pinned {
+            // CL-B-002 / operator mode: exactly one group, on the configured listen address.
+            Some(group) => ClusterDaemon::with_factory_single_group(self_addr, make, group),
+            // HUP-S8.4: every group the client joins, one swarm each.
+            None => ClusterDaemon::with_factory(self_addr, make),
+        };
         server::serve(daemon, &socket, &bearer)?;
     } else {
         let daemon = ClusterDaemon::new(self_addr, InProcessTransport::new);

@@ -11,6 +11,13 @@ description = "citrate-cluster daemon — a group's private P2P mesh (libp2p Noi
 name = "cluster-daemon"
 path = "src/main.rs"
 
+[features]
+# HUP-S8.4: LAN peer discovery (mDNS). OFF in default and release builds: it compiles libp2p's mDNS
+# stack, whose DNS-message dependency has open advisories (CL-S4 packet, "Known limits"). With the
+# feature on, a daemon still runs mDNS only when the operator sets CITRATE_CLUSTER_MDNS=1. Without
+# it, CITRATE_CLUSTER_MDNS=1 is refused at start-up. PENDING OWNER + SECURITY SIGN-OFF to ship it.
+mdns = ["libp2p/mdns"]
+
 [dependencies]
 cluster-core = { path = "../cluster-core" }
 serde = { workspace = true }

@@ -150,6 +150,37 @@ pub fn print_identity(seed_file: &Path) -> (String, String) {
 
 /// Start one daemon in libp2p mode for `group`, meshing as `device`, dialing `bootstrap` (if any).
 pub fn start(name: &str, group: &str, device: &SigningKey, bootstrap: &[String]) -> Node {
+    let port = free_port();
+    start_with(
+        name,
+        device,
+        Some(group),
+        &format!("/ip4/127.0.0.1/tcp/{port}"),
+        bootstrap,
+        &[],
+    )
+}
+
+/// HUP-S8.4: start a MULTI-GROUP daemon (no `CITRATE_CLUSTER_GROUP`): it serves every group it is
+/// asked about, one swarm each. `listen` is the base listen multiaddr; `extra_env` adds settings
+/// such as `CITRATE_CLUSTER_MDNS`.
+pub fn start_multi(
+    name: &str,
+    device: &SigningKey,
+    listen: &str,
+    extra_env: &[(&str, &str)],
+) -> Node {
+    start_with(name, device, None, listen, &[], extra_env)
+}
+
+fn start_with(
+    name: &str,
+    device: &SigningKey,
+    group: Option<&str>,
+    listen: &str,
+    bootstrap: &[String],
+    extra_env: &[(&str, &str)],
+) -> Node {
     let t = tag();
     let dir = std::env::temp_dir().join(format!("cfl-{name}-{}-{t}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("dir");
@@ -166,22 +197,30 @@ pub fn start(name: &str, group: &str, device: &SigningKey, bootstrap: &[String])
         addr(device),
         "the libp2p identity IS the device key"
     );
-    let port = free_port();
+    let port = listen
+        .rsplit('/')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
     let mut cmd = Command::new(bin());
     cmd.env("CITRATE_CLUSTER_SOCKET", &sock)
         .env("CITRATE_CLUSTER_BEARER_FILE", &bearer_file)
         .env("CITRATE_CLUSTER_SELF_ADDR", addr(device))
-        .env(
-            "CITRATE_CLUSTER_LISTEN",
-            format!("/ip4/127.0.0.1/tcp/{port}"),
-        )
+        .env("CITRATE_CLUSTER_LISTEN", listen)
         .env("CITRATE_CLUSTER_SEED_FILE", &seed_file)
-        .env("CITRATE_CLUSTER_GROUP", group)
+        .env_remove("CITRATE_CLUSTER_GROUP")
         .env_remove("CITRATE_CLUSTER_BOOTSTRAP")
+        .env_remove("CITRATE_CLUSTER_MDNS")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(g) = group {
+        cmd.env("CITRATE_CLUSTER_GROUP", g);
+    }
     if !bootstrap.is_empty() {
         cmd.env("CITRATE_CLUSTER_BOOTSTRAP", bootstrap.join(","));
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     let child = cmd.spawn().expect("spawn cluster-daemon");
     let node = Node {
@@ -192,7 +231,7 @@ pub fn start(name: &str, group: &str, device: &SigningKey, bootstrap: &[String])
         port,
         peer_id,
         address: addr(device),
-        group: group.to_string(),
+        group: group.unwrap_or_default().to_string(),
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     while UnixStream::connect(&node.sock).is_err() {
@@ -248,6 +287,50 @@ impl Node {
     pub fn online_count(&self) -> u64 {
         let st = self.call(json!({ "op": "status", "group": self.group }));
         st["online"].as_u64().unwrap_or(0)
+    }
+
+    /// HUP-S8.4: `setRoster` for a named group (multi-group daemons).
+    pub fn set_roster_in(
+        &self,
+        group: &str,
+        roster: &Value,
+        devices: &Value,
+        revocations: &Value,
+    ) -> Value {
+        self.call(json!({
+            "op": "setRoster", "group": group, "roster": roster,
+            "devices": devices, "revocations": revocations,
+        }))
+    }
+
+    /// HUP-S8.4: whether `address` is online in `group`.
+    pub fn online_in(&self, group: &str, address: &str) -> bool {
+        let v = self.call(json!({ "op": "peers", "group": group }));
+        v["peers"]
+            .as_array()
+            .map(|ps| {
+                ps.iter()
+                    .any(|p| p["address"] == address && p["online"] == true)
+            })
+            .unwrap_or(false)
+    }
+
+    /// HUP-S8.4: this node's group seed (waits until the swarm reports an address).
+    pub fn seed(&self, group: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let v = self.call(json!({ "op": "seed", "group": group }));
+            if v["type"] == "seed" {
+                return v;
+            }
+            assert!(Instant::now() < deadline, "no seed for {group}: {v}");
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// HUP-S8.4: dial the peers in a seed another node shared.
+    pub fn add_seed(&self, group: &str, seed: &str) -> Value {
+        self.call(json!({ "op": "addSeed", "group": group, "seed": seed }))
     }
 
     pub fn shared_files(&self) -> Vec<String> {
