@@ -25,5 +25,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace --locked
+      # HUP-S8.4: the opt-in mDNS build (off in release builds) must stay clippy-clean and green.
+      - name: clippy + test (mdns feature)
+        run: |
+          cargo clippy -p cluster-daemon --features mdns --all-targets --locked -- -D warnings
+          cargo test -p cluster-daemon --features mdns --locked
       - name: build release
         run: cargo build --release -p cluster-daemon
