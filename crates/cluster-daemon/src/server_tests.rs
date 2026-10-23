@@ -150,6 +150,65 @@ fn an_over_long_handshake_line_is_rejected_not_grown_unbounded() {
     );
 }
 
+// The pre-auth read is time-bounded: a connection that never sends a handshake is closed by the
+// server (EOF to the client) shortly after AUTH_TIMEOUT, rather than holding an fd forever.
+#[test]
+fn a_silent_pre_auth_connection_is_reaped_after_the_auth_timeout() {
+    let sock = short_sock("reap");
+    let _ = std::fs::remove_file(&sock);
+    let bearer = "b".repeat(64);
+    spawn_server(&sock, &bearer);
+
+    let stream = connect(&sock).expect("connect");
+    let bound = AUTH_TIMEOUT + std::time::Duration::from_secs(15);
+    stream.set_recv_timeout(Some(bound)).unwrap();
+    let mut r = BufReader::new(stream);
+    let start = std::time::Instant::now();
+    let mut line = String::new();
+    let res = r.read_line(&mut line);
+    assert!(
+        matches!(res, Ok(0)),
+        "the server must close a silent pre-auth connection (EOF), got {res:?} after {:?}",
+        start.elapsed()
+    );
+    assert!(
+        start.elapsed() < bound,
+        "closed only after {:?}",
+        start.elapsed()
+    );
+}
+
+// After authentication each request line is still capped: an over-long request with no newline
+// gets an explicit "request too large" reply instead of the server buffering it while it waits.
+#[test]
+fn an_over_long_request_after_auth_is_refused_not_buffered() {
+    let sock = short_sock("bigreq");
+    let _ = std::fs::remove_file(&sock);
+    let bearer = "b".repeat(64);
+    spawn_server(&sock, &bearer);
+
+    let stream = connect(&sock).expect("connect");
+    stream
+        .set_recv_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+    writeln!(w, "{{\"token\":\"{bearer}\"}}").unwrap();
+    let mut line = String::new();
+    r.read_line(&mut line).expect("ready line");
+    assert!(line.contains("ready"), "handshake: {line}");
+
+    let flood = "x".repeat(64 * 1024 + 16);
+    let _ = w.write_all(flood.as_bytes());
+    let _ = w.flush();
+    line.clear();
+    let res = r.read_line(&mut line);
+    assert!(
+        res.is_ok() && line.contains("request too large"),
+        "an over-long request must be refused explicitly, got {res:?} / {line:?}"
+    );
+}
+
 // CL-B-006: the control socket is created 0600 (no world-connectable window before harden).
 #[cfg(unix)]
 #[test]
