@@ -43,11 +43,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<PeerId>().map_err(|e| format!("bad PeerId {s:?}: {e}")))
+        .map(|s| {
+            s.parse::<PeerId>()
+                .map_err(|e| format!("bad PeerId {s:?}: {e}"))
+        })
         .collect::<Result<_, _>>()?;
 
     let relay = RelayNode::start(secret, listen, &allowed)?;
-    eprintln!("spike-relay: {} allows {} peers", relay.peer_id(), allowed.len());
+    eprintln!(
+        "spike-relay: {} allows {} peers",
+        relay.peer_id(),
+        allowed.len()
+    );
     loop {
         let s = relay.stats();
         println!(

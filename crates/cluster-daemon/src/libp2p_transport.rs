@@ -264,6 +264,9 @@ enum SwarmCmd {
     Publish(Vec<u8>),
     /// Network-dial a bootstrap/peer multiaddr.
     Dial(Multiaddr),
+    /// Network-dial seeded addresses, every address of one peer in a single attempt
+    /// ([`redial_plan`]).
+    DialMany(Vec<Multiaddr>),
     /// Drop every live connection to a (now-deauthorized) address.
     Disconnect(String),
     /// Report the concrete listen multiaddrs (for tests / bootstrap wiring).
@@ -553,12 +556,11 @@ impl MeshTransport for Libp2pTransport {
     /// `identify`, so a seed never lets anyone in by itself.
     fn add_peers(&mut self, addrs: &[String]) -> Result<usize, String> {
         let parsed = parse_peer_addrs(addrs, &self.local_peer)?;
-        for a in &parsed {
-            self.cmd_tx
-                .send(SwarmCmd::Dial(a.clone()))
-                .map_err(|_| "the group's mesh has stopped".to_string())?;
-        }
-        Ok(parsed.len())
+        let n = parsed.len();
+        self.cmd_tx
+            .send(SwarmCmd::DialMany(parsed))
+            .map_err(|_| "the group's mesh has stopped".to_string())?;
+        Ok(n)
     }
 
     fn link(&self, addr: &str) -> Option<&'static str> {
@@ -1166,8 +1168,9 @@ async fn swarm_loop(
                     }
                 }
                 let any_admitted = !peer_addr.is_empty();
-                for addr in redial_targets(&bootstrap, |p| swarm.is_connected(p), any_admitted) {
-                    let _ = swarm.dial(redial_opts(addr));
+                let due = redial_targets(&bootstrap, |p| swarm.is_connected(p), any_admitted);
+                for opts in redial_plan(&due) {
+                    let _ = swarm.dial(opts);
                 }
                 // HUP-S8.4: a discovered peer authorized since it was found gets in on this tick.
                 let authorized = authorized_now(&shared);
@@ -1194,6 +1197,14 @@ async fn swarm_loop(
                         // A peer dialed on request is kept for re-dial like a bootstrap peer.
                         remember_bootstrap(&mut bootstrap, addr.clone());
                         let _ = swarm.dial(redial_opts(addr));
+                    }
+                    SwarmCmd::DialMany(addrs) => {
+                        for a in &addrs {
+                            remember_bootstrap(&mut bootstrap, a.clone());
+                        }
+                        for opts in redial_plan(&addrs) {
+                            let _ = swarm.dial(opts);
+                        }
                     }
                     SwarmCmd::Disconnect(address) => {
                         let targets: Vec<PeerId> = peer_addr
@@ -1442,6 +1453,42 @@ pub(crate) fn redial_opts(addr: Multiaddr) -> DialOpts {
             .allocate_new_port()
             .build(),
     }
+}
+
+/// V60 S0-NAT-SPIKE: how a list of addresses is dialed. libp2p refuses a second dial to a peer while
+/// one is in flight, so dialing a peer's addresses one by one tries only the first (a seed that
+/// lists a LAN address before a relayed one never reached the relay). Every address naming the same
+/// peer goes into ONE attempt (libp2p dials them concurrently), in first-seen peer order; an address
+/// without a peer id is its own attempt. Each attempt allocates a new local port ([`redial_opts`]).
+pub(crate) fn redial_plan(addrs: &[Multiaddr]) -> Vec<DialOpts> {
+    let mut order: Vec<PeerId> = Vec::new();
+    let mut by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    let mut anonymous: Vec<Multiaddr> = Vec::new();
+    for a in addrs {
+        match bootstrap_peer_id(a) {
+            Some(id) => {
+                let v = by_peer.entry(id).or_insert_with(|| {
+                    order.push(id);
+                    Vec::new()
+                });
+                if !v.contains(a) {
+                    v.push(a.clone());
+                }
+            }
+            None => anonymous.push(a.clone()),
+        }
+    }
+    let mut plan: Vec<DialOpts> = order
+        .into_iter()
+        .map(|id| {
+            DialOpts::peer_id(id)
+                .addresses(by_peer.remove(&id).unwrap_or_default())
+                .allocate_new_port()
+                .build()
+        })
+        .collect();
+    plan.extend(anonymous.into_iter().map(redial_opts));
+    plan
 }
 
 /// The peer id a bootstrap multiaddr names (its LAST `/p2p/<id>`), if any. V60 S0-NAT-SPIKE: a
