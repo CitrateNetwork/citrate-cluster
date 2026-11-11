@@ -179,6 +179,11 @@ run. The counter is printed every 2 s and the relay is stopped right after the l
 cone runs' last line may predate the third circuit. All three groups reported `first_link:
 relayed`.
 
+**Re-punch.** libp2p makes one hole punch per relayed connection. A pair whose punch failed
+(symmetric NAT, or a lost race on a loaded machine; seen on macOS loopback about 1 run in 14 of the
+full test suite) stays relayed for the life of that connection. It works, but no new punch is
+attempted. A bounded re-punch is a follow-up.
+
 **Still open for MESH-3:** the deployable relay with reservations gated on a signed DeviceLink. The
 binding above gives the relay what it needs to check that (the group key's device), but it is not
 built. mDNS dial decisions read the address from the PeerId, so with relays on, two group-key
