@@ -130,3 +130,16 @@ and the findings that MESH-3 must close are in `scripts/nat-spike/RESULTS.md`.
 * **Dependencies:** adds `libp2p-relay` 0.21.1 and `libp2p-dcutr` 0.14.1 (libp2p 0.56 features)
   and a direct `multistream-select` 0.13 dependency (already in the tree). `cargo audit` to be run
   on the commit being signed.
+
+## V60 MESH-3 (2026-11-11, branch `v60/mesh-3-group-peer-ids`): group keys, new surface to review
+
+* **A second way to resolve a peer's address at identify.** A peer whose own key's address is not
+  authorized may present a group-key binding (`group_key::verify`): an EIP-191 signature by a
+  device key over `citrate-cluster group key v1`, the group id and the presenting PeerId. The peer
+  is admitted as the recovered address only if the group authorizes it. C1 holds: `connected`
+  only ever gains authorized addresses, and eviction by address drops every PeerId mapped to it.
+  The TLA models admission by address and are unchanged; to be re-run on the commit being signed.
+* **Group key derivation.** keccak256 of a tag, the group id (length-prefixed), the device secret
+  and a counter; intermediates zeroized. Only when relays are configured.
+* **Disclosure.** The binding tells anyone who completes a Noise handshake and identify which device
+  address a group PeerId acts for, the same as the device PeerId already did.

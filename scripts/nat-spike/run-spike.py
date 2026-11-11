@@ -14,7 +14,10 @@ Every process runs inside a v60-* namespace on this host. Nothing here reaches a
 relay, both members and both NATs are local namespaces. Test keys are fixed bytes (never a
 production key). Stdlib only.
 
-Usage: run-spike.py --bin-dir DIR --out DIR --label NAME [--kill-relay] [--wait-direct SECS]
+Usage: run-spike.py --bin-dir DIR --out DIR --label NAME [--kill-relay] [--wait-direct SECS] [--groups N]
+
+--groups N (V60 MESH-3): N > 1 runs both daemons unpinned (one daemon, N group swarms each) and
+checks every group meets over the relay on its own swarm, with its own co-pin.
 """
 import argparse
 import json
@@ -81,6 +84,60 @@ def ns_ss(ns):
     return [l for l in out.stdout.splitlines()[1:] if "ESTAB" in l]
 
 
+def run_groups(ipc, groups, roster, ida, idb, wait_direct):
+    """V60 MESH-3: every group meets over the relay on its own swarm, with its own co-pin."""
+    out = {}
+    for g in groups:
+        for n in ("a", "b"):
+            for op in ({"op": "setRoster", "group": g, "roster": roster}, {"op": "join", "group": g}):
+                r = ipc[n].call(op)
+                assert r.get("type") != "error", r
+    for i, g in enumerate(groups):
+        rec = {}
+        t = now_ms()
+        seed = None
+        while now_ms() - t < 20000:
+            r = ipc["b"].call({"op": "seed", "group": g})
+            if r.get("type") == "seed" and any("p2p-circuit" in x for x in r.get("addrs", [])):
+                seed = r
+                break
+            time.sleep(0.1)
+        if not seed:
+            out[g] = {"error": "B never offered a relayed address"}
+            continue
+        rec["b_peer"] = seed["addrs"][-1].rsplit("/p2p/", 1)[-1]
+        t0 = now_ms()
+        ipc["a"].call({"op": "addSeed", "group": g, "seed": seed["seed"]})
+        while now_ms() - t0 < (wait_direct + 30) * 1000:
+            peers = ipc["a"].call({"op": "peers", "group": g}).get("peers", [])
+            pb = next((p for p in peers if p["address"] == idb["address"]), None)
+            if pb and pb["online"]:
+                rec.setdefault("online_ms", now_ms() - t0)
+                rec.setdefault("first_link", pb.get("link"))
+                if pb.get("link") == "direct":
+                    rec["direct_ms"] = now_ms() - t0
+                    break
+            if "online_ms" in rec and now_ms() - t0 > rec["online_ms"] + wait_direct * 1000:
+                break
+            time.sleep(0.1)
+        if "online_ms" not in rec:
+            rec["error"] = "A never saw B online in this group"
+        else:
+            cid = CID1[:-1] + "abcdefghijklmnopqrstuvwxyz"[i % 26]  # one valid CID per group
+            t1 = now_ms()
+            while now_ms() - t1 < 20000:
+                ipc["a"].call({"op": "shareFile", "group": g, "cid": cid})
+                if cid in ipc["b"].call({"op": "status", "group": g}).get("sharedFiles", []):
+                    rec["cid_ms"] = now_ms() - t1
+                    break
+                time.sleep(0.25)
+            others = [h for h in groups if h != g]
+            rec["cid_leaked_to"] = [h for h in others if cid in
+                                    ipc["b"].call({"op": "status", "group": h}).get("sharedFiles", [])]
+        out[g] = rec
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin-dir", required=True)
@@ -88,6 +145,7 @@ def main():
     ap.add_argument("--label", required=True)
     ap.add_argument("--kill-relay", action="store_true")
     ap.add_argument("--wait-direct", type=float, default=45.0)
+    ap.add_argument("--groups", type=int, default=1)
     a = ap.parse_args()
     if os.geteuid() != 0:
         raise SystemExit("run as root (ip netns exec)")
@@ -104,9 +162,14 @@ def main():
         write_secret(f"{work}/{n}.seed", seed_hex(b))
         write_secret(f"{work}/{n}.bearer", os.urandom(32).hex())
 
+    groups = [GROUP] if a.groups <= 1 else [f"{GROUP}-{i}" for i in range(a.groups)]
+
     def identity(n):
         env = dict(os.environ, CITRATE_CLUSTER_SEED_FILE=f"{work}/{n}.seed")
-        return json.loads(subprocess.check_output([daemon, "--print-identity"], env=env))
+        argv = [daemon, "--print-identity"]
+        for g in groups:
+            argv += ["--group", g]
+        return json.loads(subprocess.check_output(argv, env=env))
 
     ida, idb = identity("a"), identity("b")
     relay_id = json.loads(subprocess.check_output(
@@ -129,7 +192,9 @@ def main():
         relay_p = spawn("relay", "v60-relay", [relay_bin], {
             "CITRATE_RELAY_SEED_FILE": f"{work}/relay.seed",
             "CITRATE_RELAY_LISTEN": f"/ip4/0.0.0.0/tcp/{RELAY_PORT}",
-            "CITRATE_RELAY_ALLOW": f"{ida['peerId']},{idb['peerId']}",
+            # V60 MESH-3: with relays, each group swarm uses its group key's PeerId.
+            "CITRATE_RELAY_ALLOW": ",".join(
+                list(ida["groupPeerIds"].values()) + list(idb["groupPeerIds"].values())),
         })
         time.sleep(0.5)
         ipc = {}
@@ -137,18 +202,23 @@ def main():
             sock = f"{work}/{n}.sock"
             if os.path.exists(sock):
                 os.unlink(sock)
-            spawn(n, f"v60-{n}", [daemon], {
+            env = {
                 "CITRATE_CLUSTER_SOCKET": sock,
                 "CITRATE_CLUSTER_BEARER_FILE": f"{work}/{n}.bearer",
                 "CITRATE_CLUSTER_SELF_ADDR": ident["address"],
                 "CITRATE_CLUSTER_SEED_FILE": f"{work}/{n}.seed",
                 "CITRATE_CLUSTER_LISTEN": f"/ip4/0.0.0.0/tcp/{MEMBER_PORT}",
-                "CITRATE_CLUSTER_GROUP": GROUP,
                 "CITRATE_CLUSTER_RELAYS": relay_addr,
-            })
+            }
+            if len(groups) == 1:
+                env["CITRATE_CLUSTER_GROUP"] = GROUP
+            spawn(n, f"v60-{n}", [daemon], env)
             wait_socket(sock)
             ipc[n] = Ipc(sock, open(f"{work}/{n}.bearer").read().strip())
         roster = [[ida["address"], "member"], [idb["address"], "member"]]
+        if len(groups) > 1:
+            result["groups"] = run_groups(ipc, groups, roster, ida, idb, a.wait_direct)
+            raise StopIteration
         for n in ("a", "b"):
             r = ipc[n].call({"op": "setRoster", "group": GROUP, "roster": roster})
             assert r.get("type") != "error", r
@@ -213,6 +283,10 @@ def main():
             result["cid2_after_relay_killed_ms"] = cid_reaches_b(CID2)
             result["a_peers_after_kill"] = ipc["a"].call({"op": "peers", "group": GROUP}).get("peers", [])
             result["a_tcp_after_kill"] = ns_ss("v60-a")
+    except StopIteration:
+        if any(g.get("error") for g in result["groups"].values()):
+            result["error"] = "a group failed: " + json.dumps(
+                {k: v.get("error") for k, v in result["groups"].items() if v.get("error")})
     except Exception as e:  # recorded, not hidden
         result["error"] = str(e)
     finally:
@@ -236,7 +310,7 @@ def main():
         json.dump(result, f, indent=2)
     print(json.dumps({k: result.get(k) for k in (
         "label", "b_reservation_ms", "online_ms", "first_link", "direct_ms", "cid1_ms",
-        "cid2_after_relay_killed_ms", "relay_last", "error")}))
+        "cid2_after_relay_killed_ms", "groups", "relay_last", "error") if k in result}))
     return 1 if "error" in result else 0
 
 

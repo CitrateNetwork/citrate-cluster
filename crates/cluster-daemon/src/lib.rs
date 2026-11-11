@@ -17,6 +17,7 @@ use cluster_core::device::{device_roster, effective_roster, DeviceRegistry};
 use cluster_core::ClusterSession;
 
 pub mod devices;
+pub mod group_key;
 pub mod ipc;
 pub mod libp2p_transport;
 pub mod relay_node;

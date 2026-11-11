@@ -374,9 +374,22 @@ impl Libp2pTransport {
         let secp_secret = identity::secp256k1::SecretKey::try_from_bytes(&mut *secret_buf)
             .map_err(|e| TransportError::BadSecret(e.to_string()))?;
         let secp_keypair = identity::secp256k1::Keypair::from(secp_secret);
-        let keypair = identity::Keypair::from(secp_keypair);
+        let device_keypair = identity::Keypair::from(secp_keypair);
         let self_address =
-            address_from_public_key(&keypair.public()).ok_or(TransportError::SelfAddress)?;
+            address_from_public_key(&device_keypair.public()).ok_or(TransportError::SelfAddress)?;
+        // V60 MESH-3: with relays, this group's swarm has its own PeerId (a group key derived from
+        // the device key) and proves it acts for the device with a signed binding in identify, so a
+        // relay routes each group's circuits to that group's swarm. Without relays: the device key.
+        let (keypair, agent) = if cfg.relays.is_empty() {
+            (device_keypair, None)
+        } else {
+            let kp = crate::group_key::derive_group_keypair(&cfg.secret, &cfg.group_id)
+                .map_err(TransportError::Build)?;
+            let agent =
+                crate::group_key::bind(&cfg.secret, &cfg.group_id, &kp.public().to_peer_id())
+                    .map_err(TransportError::Build)?;
+            (kp, Some(agent))
+        };
         let local_peer = keypair.public().to_peer_id();
 
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -394,7 +407,7 @@ impl Libp2pTransport {
         // listen + spawn under `block_on`; the spawned task then runs on the runtime's worker threads.
         let build = rt.block_on(async move {
             let relay_ids: BTreeSet<PeerId> = relays.iter().filter_map(bootstrap_peer_id).collect();
-            let mut swarm = build_swarm(keypair, &topic_task, mdns_on, relay_ids)?;
+            let mut swarm = build_swarm(keypair, &topic_task, mdns_on, relay_ids, agent)?;
             let topic = gossipsub::IdentTopic::new(topic_task.clone());
             swarm
                 .behaviour_mut()
@@ -448,6 +461,11 @@ impl Libp2pTransport {
     /// This node's canonical address (its device identity on the mesh; never the wallet address).
     pub fn self_address(&self) -> &str {
         &self.self_address
+    }
+
+    /// This group swarm's PeerId: the device PeerId, or (V60 MESH-3, with relays) the group key's.
+    pub fn peer_id(&self) -> PeerId {
+        self.local_peer
     }
 
     /// The group topic this transport meshes on.
@@ -839,6 +857,7 @@ fn build_swarm(
     group_id: &str,
     mdns_on: bool,
     relay_ids: BTreeSet<PeerId>,
+    agent: Option<String>,
 ) -> Result<Swarm<ClusterBehaviour>, TransportError> {
     // CL-B-009: bind the Noise session to the group by using the group id as the handshake prologue,
     // so a session is cryptographically scoped to the cluster it claims — a peer serving a different
@@ -875,10 +894,12 @@ fn build_swarm(
             gossipsub
                 .with_peer_score(admission_score_params(), admission_score_thresholds())
                 .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
-            let identify = identify::Behaviour::new(identify::Config::new(
-                IDENTIFY_PROTOCOL.into(),
-                key.public(),
-            ));
+            let mut identify_config = identify::Config::new(IDENTIFY_PROTOCOL.into(), key.public());
+            if let Some(agent) = agent {
+                // V60 MESH-3: the group-key binding (see `group_key`).
+                identify_config = identify_config.with_agent_version(agent);
+            }
+            let identify = identify::Behaviour::new(identify_config);
             // CL-B-009: cap the connection surface so an off-roster host cannot force unbounded Noise
             // handshakes against the listen address.
             let connection_limits = connection_limits::Behaviour::new(
@@ -1303,15 +1324,19 @@ async fn swarm_loop(
                             let _ = swarm.disconnect_peer_id(peer_id);
                             continue;
                         }
-                        let Some(address) = address_from_public_key(&info.public_key) else {
-                            let _ = swarm.disconnect_peer_id(peer_id);
-                            continue;
+                        // The peer's address: its key's own address if the group authorizes it,
+                        // else (V60 MESH-3) the device address its group-key binding names, if
+                        // the group authorizes that. Anything else is refused below.
+                        let is_authorized = |a: &str| {
+                            shared.lock().map(|s| s.authorized.contains(a)).unwrap_or(false)
                         };
-                        let authorized = shared
-                            .lock()
-                            .map(|s| s.authorized.contains(&address))
-                            .unwrap_or(false);
-                        if authorized {
+                        let resolved = address_from_public_key(&info.public_key)
+                            .filter(|a| is_authorized(a))
+                            .or_else(|| {
+                                crate::group_key::verify(&info.agent_version, &topic_name, &peer_id)
+                                    .filter(|a| is_authorized(a))
+                            });
+                        if let Some(address) = resolved {
                             let fresh = !peer_addr.contains_key(&peer_id);
                             peer_addr.insert(peer_id, address.clone());
                             ungate_peer(&mut swarm, &peer_id);
