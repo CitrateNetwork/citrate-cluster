@@ -20,6 +20,7 @@ fn cfg(seed: u8, group: &str, listen: &str, mdns: bool) -> Libp2pConfig {
         group_id: group.to_string(),
         bootstrap: vec![],
         mdns,
+        relays: vec![],
     }
 }
 

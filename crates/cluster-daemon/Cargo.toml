@@ -35,6 +35,9 @@ interprocess = "2"
 libp2p = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+# V60 S0-NAT-SPIKE: the mesh TCP transport negotiates Noise itself so it can pick the relay-hop or the
+# group prologue per connection (libp2p's upgrade builder cannot). Already in the tree via libp2p-core.
+multistream-select = "0.13"
 sha3 = { workspace = true }
 # HUP-S8.1: recover EIP-191 signers on DeviceLinks / revocations (verify only; the daemon never
 # signs a link). Already in the tree (resolved in Cargo.lock); declared directly for the verifier.

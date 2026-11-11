@@ -33,6 +33,7 @@ fn transport(seed: u8, group: &str) -> Libp2pTransport {
         group_id: group.into(),
         bootstrap: vec![],
         mdns: false,
+        relays: vec![],
     })
     .expect("transport starts")
 }
