@@ -14,6 +14,16 @@ use cluster_core::ClusterTransport;
 
 const CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
+/// The relay tests run one at a time. Under a parallel test run on macOS loopback, a DCUtR hole
+/// punch (three simultaneous-open attempts within a few ms) sometimes loses its race to CPU
+/// contention and libp2p gives up; the punch itself is not what most of these tests measure, and
+/// the one that does (`dcutr_upgrades_…`) needs the machine to itself to be deterministic.
+static RELAY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    RELAY_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn test_secret(seed: u8) -> [u8; 32] {
     let mut b = [seed; 32];
     b[0] = seed | 0x01;
@@ -160,6 +170,7 @@ fn a_peer_view_without_a_link_serializes_as_before() {
 
 #[test]
 fn a_member_reserves_on_an_allowed_relay_and_offers_the_circuit_in_its_seed() {
+    let _serial = serial();
     let (r, raddr) = relay(0x60, &[0x61]);
     let a = member(0x61, "g-relay-seed", vec![raddr]);
     let seed = wait_circuit_seed(&a, Duration::from_secs(10))
@@ -175,6 +186,7 @@ fn a_member_reserves_on_an_allowed_relay_and_offers_the_circuit_in_its_seed() {
 
 #[test]
 fn a_relay_refuses_a_member_outside_its_allow_list() {
+    let _serial = serial();
     let (r, raddr) = relay(0x62, &[0x63]);
     let stranger = member(0x64, "g-relay-deny", vec![raddr]);
     assert!(
@@ -191,6 +203,7 @@ fn a_relay_refuses_a_member_outside_its_allow_list() {
 
 #[test]
 fn two_members_mesh_through_a_relay_and_the_relay_is_never_a_mesh_peer() {
+    let _serial = serial();
     const GROUP: &str = "g-relay-mesh";
     let (r, raddr) = relay(0x65, &[0x66, 0x67]);
     let mut a = member(0x66, GROUP, vec![raddr.clone()]);
@@ -242,6 +255,7 @@ fn two_members_mesh_through_a_relay_and_the_relay_is_never_a_mesh_peer() {
 
 #[test]
 fn admission_still_decides_a_relayed_connection() {
+    let _serial = serial();
     const GROUP: &str = "g-relay-admission";
     let (_r, raddr) = relay(0x68, &[0x69, 0x6A]);
     let a = member(0x69, GROUP, vec![raddr.clone()]);
@@ -261,32 +275,52 @@ fn admission_still_decides_a_relayed_connection() {
 
 #[test]
 fn dcutr_upgrades_a_relayed_link_to_direct_when_a_direct_path_exists() {
-    // Loopback has no NAT, so the hole punch must succeed: this proves the DCUtR wiring (address
-    // candidates from the relay connection on the listen port, the group prologue on the punched
-    // connection, admission and link tracking across both connections). Whether it gets through a
-    // real NAT is the netns spike's question.
+    // Loopback has no NAT, so a hole punch has a direct path: this proves the DCUtR wiring
+    // (address candidates from the relay connection on the listen port, the group prologue on the
+    // punched connection, admission and link tracking across both connections). Whether it gets
+    // through a real NAT is the netns spike's question.
+    //
+    // libp2p makes ONE punch per relayed connection (three simultaneous-open attempts a few ms
+    // apart). On a loaded macOS runner that race is sometimes lost (about 1 run in 14 of the full
+    // suite on the Mac, 2026-11-11), and the pair then correctly stays relayed. So the test gives
+    // the punch up to three fresh pairs; every attempt must still mesh (relayed or direct), and
+    // one must go direct. Re-punching a pair that stayed relayed is a MESH-3 follow-up.
+    let _serial = serial();
     const GROUP: &str = "g-relay-dcutr";
-    let (_r, raddr) = relay(0x70, &[0x71, 0x72]);
-    let mut a = member(0x71, GROUP, vec![raddr.clone()]);
-    let mut b = member(0x72, GROUP, vec![raddr]);
-    let addr_a = a.self_address().to_string();
-    let addr_b = b.self_address().to_string();
-    a.authorize(&addr_b);
-    b.authorize(&addr_a);
-    let b_circuit = wait_circuit_seed(&b, Duration::from_secs(10)).expect("B reserved");
-    a.add_peers(&[b_circuit.to_string()]).expect("seeded");
-
-    let deadline = Instant::now() + Duration::from_secs(20);
     let direct = |t: &Libp2pTransport, peer: &str| t.links().get(peer) == Some(&LinkKind::Direct);
-    while Instant::now() < deadline && !(direct(&a, &addr_b) && direct(&b, &addr_a)) {
-        sleep(Duration::from_millis(50));
+    for attempt in 0u8..3 {
+        let (_r, raddr) = relay(0x70, &[0x71 + 2 * attempt, 0x72 + 2 * attempt]);
+        let mut a = member(0x71 + 2 * attempt, GROUP, vec![raddr.clone()]);
+        let mut b = member(0x72 + 2 * attempt, GROUP, vec![raddr]);
+        let addr_a = a.self_address().to_string();
+        let addr_b = b.self_address().to_string();
+        a.authorize(&addr_b);
+        b.authorize(&addr_a);
+        let b_circuit = wait_circuit_seed(&b, Duration::from_secs(10)).expect("B reserved");
+        a.add_peers(&[b_circuit.to_string()]).expect("seeded");
+        assert!(
+            wait_connected(&a, &addr_b, Duration::from_secs(15)),
+            "attempt {attempt}: A and B mesh through the relay"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && !(direct(&a, &addr_b) && direct(&b, &addr_a))
+            && a.nat_stats().hole_punch_failed + b.nat_stats().hole_punch_failed == 0
+        {
+            sleep(Duration::from_millis(50));
+        }
+        if direct(&a, &addr_b) && direct(&b, &addr_a) {
+            assert!(a.nat_stats().hole_punch_ok + b.nat_stats().hole_punch_ok >= 1);
+            assert_eq!(a.link(&addr_b), Some("direct"));
+            return;
+        }
+        // The punch failed: the pair must still be meshed, over the relay.
+        assert!(
+            a.connected().contains(&addr_b),
+            "attempt {attempt}: still meshed after a failed punch"
+        );
     }
-    assert!(
-        direct(&a, &addr_b) && direct(&b, &addr_a),
-        "both sides report a direct link"
-    );
-    assert!(a.nat_stats().hole_punch_ok + b.nat_stats().hole_punch_ok >= 1);
-    assert_eq!(a.link(&addr_b), Some("direct"));
+    panic!("no hole punch succeeded in three attempts on loopback");
 }
 
 /// Found in the netns spike (cone NAT, run 1): a seed lists the member's LAN address before its
