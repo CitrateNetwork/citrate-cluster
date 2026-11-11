@@ -44,11 +44,11 @@ pub const RELAY_PROLOGUE: &[u8] = b"/citrate/cluster-relay/1";
 pub const RELAY_IDENTIFY_PROTOCOL: &str = "/citrate/cluster-relay/1.0.0";
 
 /// How long one relayed circuit may stay open before the relay closes it (the members' re-dial
-/// opens a new one). The libp2p default is 2 minutes. PENDING OWNER SIGN-OFF.
+/// opens a new one). The libp2p default is 2 minutes. Owner-approved 2026-11-11.
 pub const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(30 * 60);
 
 /// Most bytes one relayed circuit may carry (each direction counted together). The libp2p default
-/// is 128 KiB. The co-pin mesh carries CIDs and gossip control frames only. PENDING OWNER SIGN-OFF.
+/// is 128 KiB. The co-pin mesh carries CIDs and gossip control frames only. Owner-approved 2026-11-11.
 pub const MAX_CIRCUIT_BYTES: u64 = 4 << 20;
 
 /// Most reservations one relay holds at a time (libp2p default 128).

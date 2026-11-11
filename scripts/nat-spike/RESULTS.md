@@ -127,7 +127,7 @@ Now every address of one peer goes into one dial attempt (`redial_plan`). Tests:
    DeviceLink check too.
 6. **Circuit limits.** This relay allows 30 minutes and 4 MiB per circuit (libp2p defaults: 2
    minutes, 128 KiB). When a circuit closes, a relayed-only pair is offline until the next re-dial
-   (at most 5 s). Owner sign-off on the limits is pending.
+   (at most 5 s). The owner approved these limits on 2026-11-11.
 7. **Seeds still carry LAN addresses.** Harmless now (they fail fast and no longer block the relayed
    address), but a member's private address is in every link it shares.
 

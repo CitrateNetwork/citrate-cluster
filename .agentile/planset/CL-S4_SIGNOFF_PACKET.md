@@ -126,7 +126,7 @@ and the findings that MESH-3 must close are in `scripts/nat-spike/RESULTS.md`.
   members. It is not deployable as is: MESH-3 gates reservations on a signed DeviceLink and fixes
   multi-group circuit routing (one PeerId per device, several group swarms).
 * **Relay limits** (`MAX_CIRCUIT_DURATION` 30 min, `MAX_CIRCUIT_BYTES` 4 MiB, 128 reservations, 64
-  circuits). PENDING OWNER SIGN-OFF.
+  circuits). The 30 min and 4 MiB limits were owner-approved on 2026-11-11; production relay hosts still need a separate owner go.
 * **Dependencies:** adds `libp2p-relay` 0.21.1 and `libp2p-dcutr` 0.14.1 (libp2p 0.56 features)
   and a direct `multistream-select` 0.13 dependency (already in the tree). `cargo audit` to be run
   on the commit being signed.
