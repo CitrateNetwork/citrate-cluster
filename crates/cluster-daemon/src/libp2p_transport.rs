@@ -1,6 +1,7 @@
 //! The **libp2p** [`MeshTransport`] (CL-S1): a real cross-machine, Noise-encrypted gossipsub mesh
 //! among a group's members. One gossipsub topic per group (`topic = group_id`, D-24), peer identity
-//! bound to the member's **secp256k1** key (CL-2 — the same key as its wallet address), and admission
+//! bound to the device's **secp256k1** key (HUP-S8.1: a per-device key linked to its member by a
+//! signed DeviceLink, never the wallet key; ADR-002 supersedes CL-2), and admission
 //! enforced **on the wire**: a connecting peer whose address is not in the group's authorized set is
 //! disconnected, and its messages are never accepted.
 //!
@@ -176,7 +177,8 @@ pub enum TransportError {
 
 /// Construction config for a group's libp2p mesh transport.
 pub struct Libp2pConfig {
-    /// The member's 32-byte secp256k1 secret (its wallet/comms/cluster key — CL-2). NEVER inline in
+    /// The device's 32-byte secp256k1 secret (HUP-S8.1 device key; a client without a DeviceLink
+    /// passes its comms key; never the wallet key). NEVER inline in
     /// argv/env: read from a 0600 file (`CITRATE_CLUSTER_SEED_FILE`). Wiped from memory when this
     /// `Libp2pConfig` is dropped (see the `Drop` impl below — CL-B-001).
     pub secret: [u8; 32],
@@ -297,7 +299,7 @@ impl Libp2pTransport {
         if cfg.mdns && !MDNS_BUILT_IN {
             return Err(TransportError::Build(NO_MDNS_BUILD.to_string()));
         }
-        // Build the libp2p identity from the member's secp256k1 secret (CL-2). `try_from_bytes`
+        // Build the libp2p identity from the device's secp256k1 secret. `try_from_bytes`
         // zeroizes the buffer we pass; `Zeroizing` also wipes it on the error path, and `cfg` (whose
         // `secret` is a copy) is wiped by its `Drop` when `new` returns (CL-B-001).
         let mut secret_buf = Zeroizing::new(cfg.secret);
@@ -372,7 +374,7 @@ impl Libp2pTransport {
         Ok((address, keypair.public().to_peer_id().to_string()))
     }
 
-    /// This node's canonical address (its cluster/comms/wallet identity).
+    /// This node's canonical address (its device identity on the mesh; never the wallet address).
     pub fn self_address(&self) -> &str {
         &self.self_address
     }
