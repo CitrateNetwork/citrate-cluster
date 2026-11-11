@@ -30,6 +30,10 @@
 //!   CITRATE_CLUSTER_BOOTSTRAP    optional comma-separated peer multiaddrs to dial on startup (the
 //!                                pinned group only; other groups take peers from group seeds)
 //!   CITRATE_CLUSTER_MDNS         optional `1`: LAN discovery for every group (off by default)
+//!   CITRATE_CLUSTER_RELAYS       optional comma-separated circuit relay multiaddrs (…/p2p/<relay id>).
+//!                                With relays, each group's swarm uses its own PeerId (a group key
+//!                                derived from the device key, bound to it by a signature in identify;
+//!                                V60 MESH-3) so relays route each group's circuits to that group.
 //!
 //! Per-group listen ports (multi-group mode): a fixed base port P gives each group
 //! `P + keccak256(group) mod 1024`, falling back to an ephemeral port when taken; base port 0 stays
@@ -61,8 +65,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut secret: [u8; 32] = <[u8; 32]>::try_from(seed_bytes.as_slice())
             .map_err(|_| "seed must be 32 bytes".to_string())?;
         let (address, peer_id) = Libp2pTransport::identity_from_secret(secret)?;
+        // V60 MESH-3: `--group <id>` (repeatable) also prints the PeerId this device's swarm for
+        // that group uses when relays are configured (the group key), e.g. for a relay allow list.
+        let args: Vec<String> = env::args().collect();
+        let mut groups = serde_json::Map::new();
+        for (i, a) in args.iter().enumerate() {
+            if a == "--group" {
+                let g = args.get(i + 1).ok_or("--group needs a group id")?;
+                let kp = cluster_daemon::group_key::derive_group_keypair(&secret, g)?;
+                groups.insert(g.clone(), kp.public().to_peer_id().to_string().into());
+            }
+        }
         secret.zeroize();
-        println!("{{\"address\":\"{address}\",\"peerId\":\"{peer_id}\"}}");
+        let mut out = serde_json::json!({ "address": address, "peerId": peer_id });
+        if !groups.is_empty() {
+            out["groupPeerIds"] = serde_json::Value::Object(groups);
+        }
+        println!("{out}");
         return Ok(());
     }
 

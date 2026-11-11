@@ -29,8 +29,17 @@ fn loopback() -> Multiaddr {
     "/ip4/127.0.0.1/tcp/0".parse().expect("loopback multiaddr")
 }
 
-fn relay(seed: u8, allowed: &[u8]) -> (RelayNode, Multiaddr) {
-    let allowed: Vec<PeerId> = allowed.iter().map(|s| peer_of(*s)).collect();
+/// V60 MESH-3: a group swarm with relays has the group key's PeerId, not the device's.
+fn gpeer(seed: u8, group: &str) -> PeerId {
+    crate::group_key::derive_group_keypair(&test_secret(seed), group)
+        .expect("derive")
+        .public()
+        .to_peer_id()
+}
+
+/// A relay allowing the group swarms named by `(device seed, group)`.
+fn relay(seed: u8, allowed: &[(u8, &str)]) -> (RelayNode, Multiaddr) {
+    let allowed: Vec<PeerId> = allowed.iter().map(|(s, g)| gpeer(*s, g)).collect();
     let r = RelayNode::start(test_secret(seed), loopback(), &allowed).expect("relay starts");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -160,13 +169,13 @@ fn a_peer_view_without_a_link_serializes_as_before() {
 
 #[test]
 fn a_member_reserves_on_an_allowed_relay_and_offers_the_circuit_in_its_seed() {
-    let (r, raddr) = relay(0x60, &[0x61]);
+    let (r, raddr) = relay(0x60, &[(0x61, "g-relay-seed")]);
     let a = member(0x61, "g-relay-seed", vec![raddr]);
     let seed = wait_circuit_seed(&a, Duration::from_secs(10))
         .expect("the member's seed offers a relayed address once its reservation is accepted");
     assert_eq!(
         bootstrap_peer_id(&seed),
-        Some(peer_of(0x61)),
+        Some(gpeer(0x61, "g-relay-seed")),
         "the circuit names the member"
     );
     assert!(r.stats().reservations_accepted >= 1);
@@ -175,7 +184,7 @@ fn a_member_reserves_on_an_allowed_relay_and_offers_the_circuit_in_its_seed() {
 
 #[test]
 fn a_relay_refuses_a_member_outside_its_allow_list() {
-    let (r, raddr) = relay(0x62, &[0x63]);
+    let (r, raddr) = relay(0x62, &[(0x63, "g-relay-deny")]);
     let stranger = member(0x64, "g-relay-deny", vec![raddr]);
     assert!(
         wait_circuit_seed(&stranger, Duration::from_secs(4)).is_none(),
@@ -184,7 +193,7 @@ fn a_relay_refuses_a_member_outside_its_allow_list() {
     let s = r.stats();
     assert_eq!(s.reservations_accepted, 0);
     assert!(
-        !s.connected.contains(&peer_of(0x64)),
+        !s.connected.contains(&gpeer(0x64, "g-relay-deny")),
         "the connection itself is refused"
     );
 }
@@ -192,7 +201,7 @@ fn a_relay_refuses_a_member_outside_its_allow_list() {
 #[test]
 fn two_members_mesh_through_a_relay_and_the_relay_is_never_a_mesh_peer() {
     const GROUP: &str = "g-relay-mesh";
-    let (r, raddr) = relay(0x65, &[0x66, 0x67]);
+    let (r, raddr) = relay(0x65, &[(0x66, GROUP), (0x67, GROUP)]);
     let mut a = member(0x66, GROUP, vec![raddr.clone()]);
     let mut b = member(0x67, GROUP, vec![raddr]);
     let addr_a = a.self_address().to_string();
@@ -237,13 +246,13 @@ fn two_members_mesh_through_a_relay_and_the_relay_is_never_a_mesh_peer() {
     assert_eq!(a.connected(), vec![addr_b.clone()]);
     assert_eq!(b.connected(), vec![addr_a.clone()]);
     let s = r.stats();
-    assert!(s.connected.contains(&peer_of(0x66)) && s.connected.contains(&peer_of(0x67)));
+    assert!(s.connected.contains(&gpeer(0x66, GROUP)) && s.connected.contains(&gpeer(0x67, GROUP)));
 }
 
 #[test]
 fn admission_still_decides_a_relayed_connection() {
     const GROUP: &str = "g-relay-admission";
-    let (_r, raddr) = relay(0x68, &[0x69, 0x6A]);
+    let (_r, raddr) = relay(0x68, &[(0x69, GROUP), (0x6A, GROUP)]);
     let a = member(0x69, GROUP, vec![raddr.clone()]);
     let mut stranger = member(0x6A, GROUP, vec![raddr]);
     let a_circuit = wait_circuit_seed(&a, Duration::from_secs(10)).expect("A reserved");
@@ -266,7 +275,7 @@ fn dcutr_upgrades_a_relayed_link_to_direct_when_a_direct_path_exists() {
     // connection, admission and link tracking across both connections). Whether it gets through a
     // real NAT is the netns spike's question.
     const GROUP: &str = "g-relay-dcutr";
-    let (_r, raddr) = relay(0x70, &[0x71, 0x72]);
+    let (_r, raddr) = relay(0x70, &[(0x71, GROUP), (0x72, GROUP)]);
     let mut a = member(0x71, GROUP, vec![raddr.clone()]);
     let mut b = member(0x72, GROUP, vec![raddr]);
     let addr_a = a.self_address().to_string();
@@ -383,7 +392,11 @@ fn group_swarms_with_relays_have_their_own_peer_ids_and_the_device_address() {
     let x2 = member_secret(test_secret(0x81), "g-gk-two", vec![raddr]);
     assert_ne!(x1.peer_id(), x2.peer_id(), "one PeerId per group swarm");
     assert_ne!(x1.peer_id(), peer_of(0x81), "not the device PeerId");
-    assert_eq!(x1.self_address(), x2.self_address(), "both act for the same device");
+    assert_eq!(
+        x1.self_address(),
+        x2.self_address(),
+        "both act for the same device"
+    );
     // Without relays nothing changes: the swarm is the device PeerId (seeds and soak kits stay valid).
     let plain = member_secret(test_secret(0x81), "g-gk-one", vec![]);
     assert_eq!(plain.peer_id(), peer_of(0x81));
@@ -397,15 +410,35 @@ fn a_group_key_binding_verifies_only_for_its_group_and_its_peer() {
     let peer = kp.public().to_peer_id();
     let agent = bind(&device, "g-bind", &peer).expect("sign");
     let (device_addr, _) = Libp2pTransport::identity_from_secret(device).expect("identity");
-    assert_eq!(verify(&agent, "g-bind", &peer), Some(device_addr));
-    assert_eq!(verify(&agent, "g-other", &peer), None, "another group");
+    assert_eq!(verify(&agent, "g-bind", &peer), Some(device_addr.clone()));
+    // A signature over another message recovers some other key, never the device's.
+    assert_ne!(
+        verify(&agent, "g-other", &peer),
+        Some(device_addr.clone()),
+        "another group"
+    );
     let other = derive_group_keypair(&device, "g-other").expect("derive");
-    assert_eq!(verify(&agent, "g-bind", &other.public().to_peer_id()), None, "another peer");
-    assert_eq!(verify("rust-libp2p/0.47.0", "g-bind", &peer), None, "no binding");
-    assert_eq!(verify(&agent.replace('a', "b"), "g-bind", &peer), None, "tampered");
+    assert_ne!(
+        verify(&agent, "g-bind", &other.public().to_peer_id()),
+        Some(device_addr.clone()),
+        "another peer"
+    );
+    assert_eq!(
+        verify("rust-libp2p/0.47.0", "g-bind", &peer),
+        None,
+        "no binding"
+    );
+    assert_ne!(
+        verify(&agent.replace('a', "b"), "g-bind", &peer),
+        Some(device_addr.clone()),
+        "tampered"
+    );
     // Deterministic: the same device and group give the same key (seeds stay valid across restarts).
     assert_eq!(
-        derive_group_keypair(&device, "g-bind").expect("derive").public().to_peer_id(),
+        derive_group_keypair(&device, "g-bind")
+            .expect("derive")
+            .public()
+            .to_peer_id(),
         peer
     );
 }
@@ -414,31 +447,7 @@ fn a_group_key_binding_verifies_only_for_its_group_and_its_peer() {
 fn a_relay_routes_each_groups_circuit_to_that_groups_swarm() {
     const G1: &str = "g-route-one";
     const G2: &str = "g-route-two";
-    let (_r, raddr) = relay(0x83, &[]);
-    // The relay allow list is keyed by PeerId; group swarms have derived ids, so allow those.
-    drop(_r);
-    let ids = |seed: u8| -> Vec<PeerId> {
-        [G1, G2]
-            .iter()
-            .map(|g| {
-                crate::group_key::derive_group_keypair(&test_secret(seed), g)
-                    .expect("derive")
-                    .public()
-                    .to_peer_id()
-            })
-            .collect()
-    };
-    let allowed: Vec<PeerId> = ids(0x84).into_iter().chain(ids(0x85)).collect();
-    let r = RelayNode::start(test_secret(0x83), loopback(), &allowed).expect("relay");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let raddr = loop {
-        if let Some(a) = r.listeners().expect("listeners").into_iter().next() {
-            break a.with(Protocol::P2p(r.peer_id()));
-        }
-        assert!(Instant::now() < deadline, "relay listener never came up");
-        sleep(Duration::from_millis(20));
-    };
-    let _ = raddr.clone();
+    let (_r, raddr) = relay(0x83, &[(0x84, G1), (0x84, G2), (0x85, G1), (0x85, G2)]);
     // Device X serves both groups; device Y serves both groups. Each pair meets ONLY via X's
     // relayed addresses.
     let mut x: Vec<Libp2pTransport> = [G1, G2]
@@ -449,7 +458,10 @@ fn a_relay_routes_each_groups_circuit_to_that_groups_swarm() {
         .iter()
         .map(|g| member_secret(test_secret(0x85), g, vec![raddr.clone()]))
         .collect();
-    let (xa, ya) = (x[0].self_address().to_string(), y[0].self_address().to_string());
+    let (xa, ya) = (
+        x[0].self_address().to_string(),
+        y[0].self_address().to_string(),
+    );
     for t in x.iter_mut() {
         t.authorize(&ya);
     }
@@ -465,33 +477,17 @@ fn a_relay_routes_each_groups_circuit_to_that_groups_swarm() {
             wait_connected(&y[i], &xa, Duration::from_secs(15)),
             "group {i}: Y meets X through the relay, on that group's swarm"
         );
-        assert!(wait_connected(&x[i], &ya, Duration::from_secs(5)), "group {i}: X admits Y");
+        assert!(
+            wait_connected(&x[i], &ya, Duration::from_secs(5)),
+            "group {i}: X admits Y"
+        );
     }
 }
 
 #[test]
 fn a_binding_signed_by_a_device_outside_the_group_is_refused() {
     const GROUP: &str = "g-gk-refuse";
-    let (_r, raddr) = relay(0x86, &[]);
-    drop(_r);
-    let host_id = crate::group_key::derive_group_keypair(&test_secret(0x87), GROUP)
-        .expect("derive")
-        .public()
-        .to_peer_id();
-    let stranger_id = crate::group_key::derive_group_keypair(&test_secret(0x88), GROUP)
-        .expect("derive")
-        .public()
-        .to_peer_id();
-    let r = RelayNode::start(test_secret(0x86), loopback(), &[host_id, stranger_id]).expect("relay");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let raddr = loop {
-        if let Some(a) = r.listeners().expect("listeners").into_iter().next() {
-            break a.with(Protocol::P2p(r.peer_id()));
-        }
-        assert!(Instant::now() < deadline);
-        sleep(Duration::from_millis(20));
-    };
-    let _ = raddr.clone();
+    let (_r, raddr) = relay(0x86, &[(0x87, GROUP), (0x88, GROUP)]);
     let host = member_secret(test_secret(0x87), GROUP, vec![raddr.clone()]);
     let mut stranger = member_secret(test_secret(0x88), GROUP, vec![raddr]);
     stranger.authorize(host.self_address());

@@ -106,12 +106,12 @@ Now every address of one peer goes into one dial attempt (`redial_plan`). Tests:
    keeps the group prologue, so the relay sees ciphertext and cannot join a group. This needed a
    hand-written TCP upgrade (`mesh_tcp_transport`) because libp2p's builder applies one upgrade to
    every connection.
-2. **One daemon, many groups, one PeerId: circuits can reach the wrong swarm.** Each group swarm
+2. **One daemon, many groups, one PeerId: circuits can reach the wrong swarm.** Fixed in MESH-3
+   (see "MESH-3: a PeerId per group swarm" below). Each group swarm
    reserves on the relay under the same PeerId, and the relay routes a circuit to the first
    connection holding a reservation for that PeerId (`libp2p-relay` 0.21.1, `behaviour.rs`). A
    circuit for group B can land on group A's swarm and fail the Noise prologue. The spike ran with
-   one pinned group. MESH-3 has to pick a fix: a per-group relay PeerId, one relay connection that
-   carries every group's circuits, or a relay that routes by group.
+   one pinned group.
 3. **AutoNAT does not fit as is.** AutoNAT v1 decides reachability by having a server dial back to
    the member's listen address. The server's TCP session would use its own prologue and the member's
    listener expects the group prologue, so every dial-back would fail and every member would look
@@ -144,3 +144,44 @@ python3 run-spike.py --bin-dir ../../target/release --out /tmp/nat-run --label c
 
 `run-spike.py` writes `result.json` (timings, `ss` snapshots, peers, the daemons' NAT log lines) and
 the three processes' logs into `--out`.
+
+## MESH-3: a PeerId per group swarm (2026-11-11, branch `v60/mesh-3-group-peer-ids`)
+
+**Bug.** Every group swarm of a device used the device PeerId, and the relay routes a circuit to the
+first connection holding a reservation for that PeerId. Reproduced on loopback before the fix with
+two groups per device: 2 of 3 runs failed with one group never meeting (`[false, true]`); 1 of 3
+passed, depending on the relay's HashSet order.
+
+**Fix (`group_key.rs`).** With relays configured, each group swarm uses a group key derived from the
+device secret and the group id (deterministic), so each group has its own PeerId and the relay
+routes by PeerId correctly. The swarm proves the group key acts for the device with an EIP-191
+signature by the device key over the group id and the group PeerId, carried in identify's
+`agent_version`. A receiver admits the peer as the recovered device address only if the group
+authorizes that address; the binding names the group and the PeerId, so it cannot be replayed into
+another group or by another key. Without relays nothing changes (device PeerId; seeds, soak kits and
+older daemons as before). `--print-identity --group <id>` prints the group PeerIds (relay allow
+lists).
+
+**Netns runs with the fix** (`run-spike.py --groups 3`: both daemons unpinned, three group swarms
+each, one relay). Records in [`runs-2026-11-11-mesh3.jsonl`](runs-2026-11-11-mesh3.jsonl).
+
+| Run | NAT | Groups met over the relay | Direct after | Co-pin per group | Co-pin seen in another group |
+|---|---|---|---|---|---|
+| m3-cone-1 | endpoint-independent | 3/3 (263 to 304 ms) | 3/3 (383 to 423 ms) | 3/3 (324 to 336 ms) | none |
+| m3-cone-2 | endpoint-independent | 3/3 (282 to 284 ms) | 3/3 (400 to 407 ms) | 3/3 | none |
+| m3-cone-3 | endpoint-independent | 3/3 (282 to 298 ms) | 3/3 (394 to 416 ms) | 3/3 (52 to 54 ms) | none |
+| m3-cone-pinned | endpoint-independent, one pinned group | 1/1 (256 ms) | 1/1 (367 ms) | yes; again after the relay was killed (336 ms) | n/a |
+| m3-sym-1 | symmetric | 3/3 (257 to 282 ms) | 0/3 (as expected) | 3/3 over the relay (319 to 339 ms) | none |
+
+Each group's relayed address named a different PeerId, and the relay held 6 reservations (2
+devices × 3 groups). The relay's circuit counter read 2 in the cone runs and 3 in the symmetric
+run. The counter is printed every 2 s and the relay is stopped right after the last co-pin, so the
+cone runs' last line may predate the third circuit. All three groups reported `first_link:
+relayed`.
+
+**Still open for MESH-3:** the deployable relay with reservations gated on a signed DeviceLink. The
+binding above gives the relay what it needs to check that (the group key's device), but it is not
+built. mDNS dial decisions read the address from the PeerId, so with relays on, two group-key
+swarms do not dial each other from mDNS alone (mDNS is off by default and not built into release).
+A daemon with relays cannot mesh with a daemon from before this change in the same group (the
+older one cannot read the binding).
