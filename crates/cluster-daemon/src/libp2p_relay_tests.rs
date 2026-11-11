@@ -288,3 +288,70 @@ fn dcutr_upgrades_a_relayed_link_to_direct_when_a_direct_path_exists() {
     assert!(a.nat_stats().hole_punch_ok + b.nat_stats().hole_punch_ok >= 1);
     assert_eq!(a.link(&addr_b), Some("direct"));
 }
+
+/// Found in the netns spike (cone NAT, run 1): a seed lists the member's LAN address before its
+/// relayed address. Each address was dialed on its own, and libp2p refuses a second dial to a peer
+/// while one is in flight, so the relayed address was never tried and the members never met.
+#[test]
+fn a_seed_whose_first_address_is_dead_still_reaches_the_peer() {
+    const GROUP: &str = "g-dead-first";
+    let mut a = member(0x74, GROUP, vec![]);
+    let mut b = member(0x75, GROUP, vec![]);
+    let addr_a = a.self_address().to_string();
+    let addr_b = b.self_address().to_string();
+    a.authorize(&addr_b);
+    b.authorize(&addr_a);
+    let b_live = b
+        .seed_multiaddrs()
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .or_else(|| {
+            sleep(Duration::from_millis(300));
+            b.seed_multiaddrs().ok().and_then(|v| v.into_iter().next())
+        })
+        .expect("B listens");
+    let b_id = bootstrap_peer_id(&b_live).expect("seed names B");
+    // Port 1 on loopback: nothing listens there, the dial fails.
+    let dead: Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{b_id}")
+        .parse()
+        .expect("addr");
+    a.add_peers(&[dead.to_string(), b_live.to_string()])
+        .expect("seeded");
+    assert!(
+        wait_connected(&a, &addr_b, Duration::from_secs(12)),
+        "the live address is dialed even though the dead one comes first"
+    );
+}
+
+#[test]
+fn a_redial_plan_dials_every_address_of_a_peer_in_one_attempt() {
+    let p1 = peer_of(0x76);
+    let p2 = peer_of(0x77);
+    let addrs: Vec<Multiaddr> = [
+        format!("/ip4/192.168.20.2/tcp/4201/p2p/{p1}"),
+        format!("/ip4/10.99.0.9/tcp/4201/p2p/{p2}"),
+        format!(
+            "/ip4/10.99.0.1/tcp/4100/p2p/{}/p2p-circuit/p2p/{p1}",
+            peer_of(0x78)
+        ),
+        "/ip4/10.0.0.3/tcp/4211".to_string(),
+    ]
+    .iter()
+    .map(|a| a.parse().expect("multiaddr"))
+    .collect();
+    let plan = redial_plan(&addrs);
+    let ids: Vec<Option<PeerId>> = plan.iter().map(|d| d.get_peer_id()).collect();
+    assert_eq!(
+        ids,
+        vec![Some(p1), Some(p2), None],
+        "one attempt per peer, in first-seen order"
+    );
+    let first = format!("{:?}", plan[0]);
+    assert!(
+        first.contains("192.168.20.2") && first.contains("p2p-circuit"),
+        "{first}"
+    );
+    assert!(plan
+        .iter()
+        .all(|d| format!("{d:?}").contains("port_use: New")));
+}
