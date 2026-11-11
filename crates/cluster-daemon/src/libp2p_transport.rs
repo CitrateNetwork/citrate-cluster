@@ -42,7 +42,13 @@
 //!   (`cluster_core::seed`, [`MeshTransport::add_peers`]); and, HUP-S8.4, opt-in mDNS on the local
 //!   network ([`Libp2pConfig::mdns`], off by default). mDNS only dials a discovered peer whose
 //!   PeerId resolves to an address the group authorizes, and re-dials it while it stays discovered.
-//!   Kademlia and NAT traversal remain follow-ons.
+//!   Kademlia remains a follow-on.
+//! * **NAT traversal** (V60 S0-NAT-SPIKE): with relays configured ([`Libp2pConfig::relays`],
+//!   `CITRATE_CLUSTER_RELAYS`), the swarm holds a circuit relay v2 reservation on each relay, offers
+//!   the relayed address in its seed, and runs DCUtR so two members that first meet through a relay
+//!   try to hole-punch a direct connection. A relayed connection is admitted at `identify` exactly
+//!   like a direct one; the relay itself is identified but never admitted or counted. The relay hop
+//!   uses [`RELAY_PROLOGUE`] (a relay serves many groups), every other connection the group prologue.
 //! * **One swarm per group, one daemon for every group** (HUP-S8.4): each group gets its own swarm
 //!   (its own topic, Noise prologue and listen port) under the same device identity, built by a
 //!   per-group factory ([`Libp2pFactory`]) on one shared tokio runtime. Admission state never
@@ -59,18 +65,23 @@
 //!   without a restart. Each re-dial is still admitted only at `identify`, so the invariant is
 //!   unchanged; a refused peer costs one Noise handshake per interval.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
+use futures::{AsyncRead, AsyncWrite};
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::{Boxed, ListenerId};
+use libp2p::core::upgrade::{InboundConnectionUpgrade, OutboundConnectionUpgrade, UpgradeInfo};
+use libp2p::core::{ConnectedPoint, Transport};
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::dial_opts::DialOpts;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{connection_limits, gossipsub, identify, identity, noise, tcp, yamux};
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
+use libp2p::{connection_limits, dcutr, gossipsub, identify, identity, noise, relay, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder};
 use sha3::{Digest, Keccak256};
 use tokio::runtime::Runtime;
@@ -80,6 +91,7 @@ use zeroize::{Zeroize, Zeroizing};
 use cluster_core::{canonical_address, ClusterTransport};
 
 use crate::ipc::MeshMessage;
+pub use crate::relay_node::RELAY_PROLOGUE;
 use crate::transport::MeshTransport;
 
 /// libp2p protocol string advertised over `identify` (carries our public key for address resolution).
@@ -154,6 +166,47 @@ const GOSSIP_THRESHOLD: f64 = -10.0;
 const PUBLISH_THRESHOLD: f64 = -50.0;
 const GRAYLIST_THRESHOLD: f64 = -10_000.0;
 
+/// V60 S0-NAT-SPIKE: the most relays a node holds reservations on (`CITRATE_CLUSTER_RELAYS`).
+pub const MAX_RELAYS: usize = 4;
+
+/// V60 S0-NAT-SPIKE: how a member is reached right now. `Direct` when at least one connection to it
+/// is a plain TCP connection (dialed, accepted or hole-punched), `Relayed` when every connection
+/// goes through a circuit relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    Direct,
+    Relayed,
+}
+
+impl LinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkKind::Direct => "direct",
+            LinkKind::Relayed => "relayed",
+        }
+    }
+}
+
+/// V60 S0-NAT-SPIKE: the kind of a connection, from an address on its endpoint.
+pub(crate) fn link_of(addr: &Multiaddr) -> LinkKind {
+    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        LinkKind::Relayed
+    } else {
+        LinkKind::Direct
+    }
+}
+
+/// V60 S0-NAT-SPIKE: NAT traversal counters for one group swarm (tests and the spike numbers).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NatStats {
+    /// New reservations a relay accepted for us (renewals not counted).
+    pub reservations_accepted: u64,
+    /// DCUtR hole punches that produced a direct connection.
+    pub hole_punch_ok: u64,
+    /// DCUtR hole punches that failed (the members stay on the relay).
+    pub hole_punch_failed: u64,
+}
+
 /// Errors from constructing / listening the transport. The [`ClusterTransport`] surface itself is
 /// infallible (the daemon drives it with `()` returns); all fallible work is in [`Libp2pTransport::new`].
 #[derive(Debug, thiserror::Error)]
@@ -191,6 +244,9 @@ pub struct Libp2pConfig {
     /// opts in (`CITRATE_CLUSTER_MDNS=1`): mDNS tells the LAN this device's PeerId. Discovery never
     /// admits anyone; it only supplies addresses to dial.
     pub mdns: bool,
+    /// V60 S0-NAT-SPIKE: circuit relays to reserve on, each `/…/p2p/<relay peer id>`
+    /// ([`parse_relay_addrs`]). Empty: no relay, no reservation (the pre-spike behaviour).
+    pub relays: Vec<Multiaddr>,
 }
 
 /// CL-B-001: scrub the 32-byte secp256k1 secret from memory when the config is dropped. A manual
@@ -226,6 +282,10 @@ struct Shared {
     connected: BTreeSet<String>,
     /// Inbox of accepted mesh messages, drained by the daemon.
     inbox: Vec<MeshMessage>,
+    /// V60 S0-NAT-SPIKE: how each connected address is reached (keys ⊆ `connected`).
+    links: BTreeMap<String, LinkKind>,
+    /// V60 S0-NAT-SPIKE: NAT traversal counters.
+    nat: NatStats,
 }
 
 /// The libp2p-backed [`MeshTransport`]. One instance == one group's mesh (one topic, one swarm).
@@ -258,6 +318,11 @@ struct ClusterBehaviour {
     identify: identify::Behaviour,
     /// CL-B-009: refuse connections past the caps before they cost a Noise handshake.
     connection_limits: connection_limits::Behaviour,
+    /// V60 S0-NAT-SPIKE: circuit relay v2 client (reservations on the configured relays, and dials
+    /// through them). Idle when no relay is configured.
+    relay_client: relay::client::Behaviour,
+    /// V60 S0-NAT-SPIKE: direct connection upgrade through relay (hole punching).
+    dcutr: dcutr::Behaviour,
     /// HUP-S8.4: LAN discovery, present only when [`Libp2pConfig::mdns`] is set (and the daemon is
     /// built with the `mdns` feature).
     mdns: Toggle<MdnsBehaviour>,
@@ -317,12 +382,14 @@ impl Libp2pTransport {
         let listen = cfg.listen.clone();
         let bootstrap = cfg.bootstrap.clone();
         let mdns_on = cfg.mdns;
+        let relays = cfg.relays.clone();
         let shared_task = Arc::clone(&shared);
 
         // All swarm construction must happen inside the runtime context (`.with_tokio()`), so build +
         // listen + spawn under `block_on`; the spawned task then runs on the runtime's worker threads.
         let build = rt.block_on(async move {
-            let mut swarm = build_swarm(keypair, &topic_task, mdns_on)?;
+            let relay_ids: BTreeSet<PeerId> = relays.iter().filter_map(bootstrap_peer_id).collect();
+            let mut swarm = build_swarm(keypair, &topic_task, mdns_on, relay_ids)?;
             let topic = gossipsub::IdentTopic::new(topic_task.clone());
             swarm
                 .behaviour_mut()
@@ -345,6 +412,7 @@ impl Libp2pTransport {
                 cmd_rx,
                 shared_task,
                 bootstrap,
+                relays,
             ));
             Ok::<_, TransportError>(task)
         })?;
@@ -402,6 +470,22 @@ impl Libp2pTransport {
         rx.blocking_recv().map_err(|_| TransportError::Closed)
     }
 
+    /// V60 S0-NAT-SPIKE: how each connected member address is reached (direct or relayed).
+    pub fn links(&self) -> BTreeMap<String, LinkKind> {
+        self.shared
+            .lock()
+            .map(|s| s.links.clone())
+            .unwrap_or_default()
+    }
+
+    /// V60 S0-NAT-SPIKE: this swarm's NAT traversal counters.
+    pub fn nat_stats(&self) -> NatStats {
+        self.shared
+            .lock()
+            .map(|s| s.nat.clone())
+            .unwrap_or_default()
+    }
+
     /// Network-dial a peer's multiaddr (bootstrap wiring). Admission still gates the resulting
     /// connection — dialing does not imply authorizing.
     pub fn dial_multiaddr(&self, addr: Multiaddr) -> Result<(), TransportError> {
@@ -428,6 +512,7 @@ impl ClusterTransport for Libp2pTransport {
             if let Ok(mut s) = self.shared.lock() {
                 s.authorized.remove(&a);
                 s.connected.remove(&a);
+                s.links.remove(&a);
             }
             let _ = self.cmd_tx.send(SwarmCmd::Disconnect(a));
         }
@@ -474,6 +559,14 @@ impl MeshTransport for Libp2pTransport {
                 .map_err(|_| "the group's mesh has stopped".to_string())?;
         }
         Ok(parsed.len())
+    }
+
+    fn link(&self, addr: &str) -> Option<&'static str> {
+        let a = canonical_address(addr)?;
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| s.links.get(&a).map(|k| k.as_str()))
     }
 
     fn seed_addrs(&self) -> Result<Vec<String>, String> {
@@ -526,6 +619,9 @@ pub struct NodeConfig {
     pub bootstrap: Vec<Multiaddr>,
     /// `CITRATE_CLUSTER_MDNS=1`: LAN discovery for every group's swarm. Off by default.
     pub mdns: bool,
+    /// V60 S0-NAT-SPIKE: `CITRATE_CLUSTER_RELAYS`, comma-separated relay multiaddrs. Every group's
+    /// swarm reserves on them. Unset: no relay.
+    pub relays: Vec<Multiaddr>,
 }
 
 impl NodeConfig {
@@ -536,6 +632,7 @@ impl NodeConfig {
     /// * `CITRATE_CLUSTER_GROUP`: optional: pin the daemon to one group (pre-HUP-S8.4 behaviour).
     /// * `CITRATE_CLUSTER_BOOTSTRAP`: optional comma-separated peer multiaddrs (pinned group only).
     /// * `CITRATE_CLUSTER_MDNS`: optional, `1`/`true` turns LAN discovery on.
+    /// * `CITRATE_CLUSTER_RELAYS`: optional comma-separated relay multiaddrs (`…/p2p/<relay id>`).
     pub fn from_env() -> Result<Self, String> {
         let seed_file = std::env::var("CITRATE_CLUSTER_SEED_FILE")
             .ok()
@@ -586,12 +683,17 @@ impl NodeConfig {
             return Err(NO_MDNS_BUILD.to_string());
         }
 
+        let relays =
+            parse_relay_addrs(&std::env::var("CITRATE_CLUSTER_RELAYS").unwrap_or_default())
+                .map_err(|e| format!("CITRATE_CLUSTER_RELAYS: {e}"))?;
+
         Ok(NodeConfig {
             secret,
             listen,
             pinned_group,
             bootstrap,
             mdns,
+            relays,
         })
     }
 
@@ -611,6 +713,34 @@ pub(crate) fn parse_flag(v: Option<&str>) -> Result<bool, String> {
             "CITRATE_CLUSTER_MDNS must be 1 or 0, got {other:?}"
         )),
     }
+}
+
+/// V60 S0-NAT-SPIKE: parse a comma-separated relay list. Each entry must be a multiaddr ending in the
+/// relay's `/p2p/<peer id>` (the relay hop is chosen by that id) and must not itself be a circuit.
+/// At most [`MAX_RELAYS`]. Empty entries are skipped; an empty list is no relays.
+pub fn parse_relay_addrs(list: &str) -> Result<Vec<Multiaddr>, String> {
+    let mut out: Vec<Multiaddr> = Vec::new();
+    for (i, raw) in list.split(',').map(str::trim).enumerate() {
+        if raw.is_empty() {
+            continue;
+        }
+        let ma: Multiaddr = raw
+            .parse()
+            .map_err(|_| format!("relay {} is not a multiaddr", i + 1))?;
+        if ma.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            return Err(format!("relay {} is a circuit address, not a relay", i + 1));
+        }
+        if !matches!(ma.iter().last(), Some(Protocol::P2p(_))) {
+            return Err(format!("relay {} must end in /p2p/<relay peer id>", i + 1));
+        }
+        if !out.contains(&ma) {
+            out.push(ma);
+        }
+    }
+    if list.split(',').filter(|r| !r.trim().is_empty()).count() > MAX_RELAYS {
+        return Err(format!("at most {MAX_RELAYS} relays"));
+    }
+    Ok(out)
 }
 
 /// HUP-S8.4: the listen address for `group`'s swarm. A base with TCP port 0 stays ephemeral; a fixed
@@ -685,6 +815,7 @@ impl Libp2pFactory {
             group_id: group.to_string(),
             bootstrap: bootstrap.clone(),
             mdns: self.node.mdns,
+            relays: self.node.relays.clone(),
         };
         match Libp2pTransport::new_on(cfg(listen.clone()), Arc::clone(&self.rt)) {
             Ok(t) => Ok(t),
@@ -703,23 +834,29 @@ fn build_swarm(
     keypair: identity::Keypair,
     group_id: &str,
     mdns_on: bool,
+    relay_ids: BTreeSet<PeerId>,
 ) -> Result<Swarm<ClusterBehaviour>, TransportError> {
     // CL-B-009: bind the Noise session to the group by using the group id as the handshake prologue,
     // so a session is cryptographically scoped to the cluster it claims — a peer serving a different
     // group cannot complete a Noise handshake with us at all (the transport gains a notion of cluster
     // it previously lacked; app-layer admission remains the authorization boundary).
+    // V60 S0-NAT-SPIKE: the only exception is a TCP connection we dial to a configured relay, which
+    // uses RELAY_PROLOGUE (see `mesh_tcp_transport`). The end-to-end connection to a member through
+    // a relay is its own Noise session and keeps the group prologue (the relay-client upgrade below).
     let prologue = group_id.as_bytes().to_vec();
+    let circuit_prologue = prologue.clone();
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
+        .with_other_transport(|k: &identity::Keypair| mesh_tcp_transport(k, prologue, relay_ids))
+        .map_err(|e| TransportError::Build(format!("tcp: {e}")))?
+        .with_relay_client(
             move |k: &identity::Keypair| {
-                noise::Config::new(k).map(|c| c.with_prologue(prologue.clone()))
+                noise::Config::new(k).map(|c| c.with_prologue(circuit_prologue.clone()))
             },
             yamux::Config::default,
         )
-        .map_err(|e| TransportError::Build(format!("tcp: {e}")))?
-        .with_behaviour(|key| {
+        .map_err(|e| TransportError::Build(format!("relay client: {e}")))?
+        .with_behaviour(|key, relay_client| {
             // PBA-L6b-006: never flood-publish. With the default `flood_publish(true)` every peer
             // subscribed to the topic — including one that never ran `identify` and so was never
             // admitted — received every publication. Publications now go to the mesh (plus
@@ -749,10 +886,13 @@ fn build_swarm(
             // HUP-S8.4: LAN discovery only when the operator opted in (and it is built in).
             let mdns = mdns_behaviour(mdns_on, key)
                 .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
             Ok(ClusterBehaviour {
                 gossipsub,
                 identify,
                 connection_limits,
+                relay_client,
+                dcutr,
                 mdns: Toggle::from(mdns),
             })
         })
@@ -760,6 +900,128 @@ fn build_swarm(
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_TIMEOUT))
         .build();
     Ok(swarm)
+}
+
+/// The member's TCP output: the authenticated peer and its multiplexed connection.
+type MeshConn = (PeerId, StreamMuxerBox);
+
+/// V60 S0-NAT-SPIKE: TCP + Noise + yamux, with the Noise prologue chosen per connection: a connection
+/// we DIAL whose target `/p2p/` id is a configured relay uses [`RELAY_PROLOGUE`]; every other
+/// connection (inbound, dialed to a member, hole-punched) uses the group prologue. libp2p's upgrade
+/// builder applies one fixed upgrade to every connection, so the negotiation is done here with the
+/// same steps it takes (multistream-select V1Lazy, Noise, then yamux).
+fn mesh_tcp_transport(
+    key: &identity::Keypair,
+    group_prologue: Vec<u8>,
+    relay_ids: BTreeSet<PeerId>,
+) -> Boxed<MeshConn> {
+    let key = key.clone();
+    tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+        .and_then(move |stream, endpoint: ConnectedPoint| {
+            let prologue = if dials_a_relay(&endpoint, &relay_ids) {
+                RELAY_PROLOGUE.to_vec()
+            } else {
+                group_prologue.clone()
+            };
+            let key = key.clone();
+            async move { secure_and_multiplex(stream, endpoint, &key, prologue).await }
+        })
+        .boxed()
+}
+
+/// Whether this connection is one we dialed to a configured relay (the swarm appends the target's
+/// `/p2p/` id to every dial address). A hole-punch dial (`role_override` = listener) is never a relay.
+fn dials_a_relay(endpoint: &ConnectedPoint, relay_ids: &BTreeSet<PeerId>) -> bool {
+    match endpoint {
+        ConnectedPoint::Dialer {
+            address,
+            role_override,
+            ..
+        } => {
+            role_override.is_dialer()
+                && bootstrap_peer_id(address).is_some_and(|p| relay_ids.contains(&p))
+        }
+        ConnectedPoint::Listener { .. } => false,
+    }
+}
+
+fn io_err(e: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(e.to_string())
+}
+
+/// Negotiate and run Noise (with `prologue`) and then yamux on `stream`, as dialer or listener per
+/// `endpoint` (a hole-punch dial with a listener `role_override` takes the listener side).
+async fn secure_and_multiplex<S>(
+    stream: S,
+    endpoint: ConnectedPoint,
+    key: &identity::Keypair,
+    prologue: Vec<u8>,
+) -> Result<MeshConn, std::io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use multistream_select::{dialer_select_proto, listener_select_proto, Version};
+    let outbound = matches!(
+        &endpoint,
+        ConnectedPoint::Dialer { role_override, .. } if role_override.is_dialer()
+    );
+    let noise = noise::Config::new(key)
+        .map_err(io_err)?
+        .with_prologue(prologue);
+    let (peer, secured) = if outbound {
+        let (proto, io) = dialer_select_proto(stream, noise.protocol_info(), Version::V1Lazy)
+            .await
+            .map_err(io_err)?;
+        noise.upgrade_outbound(io, proto).await.map_err(io_err)?
+    } else {
+        let (proto, io) = listener_select_proto(stream, noise.protocol_info())
+            .await
+            .map_err(io_err)?;
+        noise.upgrade_inbound(io, proto).await.map_err(io_err)?
+    };
+    let mux = yamux::Config::default();
+    let muxer = if outbound {
+        let (proto, io) = dialer_select_proto(secured, mux.protocol_info(), Version::V1Lazy)
+            .await
+            .map_err(io_err)?;
+        mux.upgrade_outbound(io, proto).await.map_err(io_err)?
+    } else {
+        let (proto, io) = listener_select_proto(secured, mux.protocol_info())
+            .await
+            .map_err(io_err)?;
+        mux.upgrade_inbound(io, proto).await.map_err(io_err)?
+    };
+    Ok((peer, StreamMuxerBox::new(muxer)))
+}
+
+/// V60 S0-NAT-SPIKE: recompute how each admitted address is reached from its live connections.
+fn refresh_links(
+    conn_kind: &HashMap<ConnectionId, (PeerId, LinkKind)>,
+    peer_addr: &HashMap<PeerId, String>,
+    shared: &Arc<Mutex<Shared>>,
+) {
+    let mut links: BTreeMap<String, LinkKind> = BTreeMap::new();
+    for (peer, kind) in conn_kind.values() {
+        let Some(address) = peer_addr.get(peer) else {
+            continue;
+        };
+        let e = links.entry(address.clone()).or_insert(*kind);
+        if *kind == LinkKind::Direct {
+            *e = LinkKind::Direct;
+        }
+    }
+    if let Ok(mut s) = shared.lock() {
+        links.retain(|a, _| s.connected.contains(a));
+        s.links = links;
+    }
+}
+
+/// Milliseconds since the Unix epoch, for the mesh's NAT log lines.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// The refusal when mDNS is asked of a build without it.
@@ -845,9 +1107,22 @@ async fn swarm_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCmd>,
     shared: Arc<Mutex<Shared>>,
     mut bootstrap: Vec<Multiaddr>,
+    relays: Vec<Multiaddr>,
 ) {
     // PeerId → resolved member address, for authenticated senders we have identified.
     let mut peer_addr: HashMap<PeerId, String> = HashMap::new();
+    // V60 S0-NAT-SPIKE: the configured relays (identified, kept connected, never admitted), the
+    // circuit listener held on each (None until listening or after it closed), and every live
+    // connection's kind (direct or relayed).
+    let relay_ids: BTreeSet<PeerId> = relays.iter().filter_map(bootstrap_peer_id).collect();
+    let mut relay_listen: Vec<(Multiaddr, Option<ListenerId>)> = relays
+        .iter()
+        .map(|r| (r.clone().with(Protocol::P2pCircuit), None))
+        .collect();
+    // Reservations start once our TCP listener is up, so the relay connection leaves from the
+    // listen port (port reuse) and the relay observes the NAT mapping a hole punch will use.
+    let mut relays_started = false;
+    let mut conn_kind: HashMap<ConnectionId, (PeerId, LinkKind)> = HashMap::new();
     // PBA-L6b-006: connections established but not yet identified, with when they were first seen.
     let mut unidentified: HashMap<PeerId, Instant> = HashMap::new();
     let mut sweep = tokio::time::interval(IDENTIFY_SWEEP);
@@ -885,6 +1160,11 @@ async fn swarm_loop(
                 }
             }
             _ = redial.tick() => {
+                if relays_started {
+                    for (circuit, listener) in relay_listen.iter_mut().filter(|(_, l)| l.is_none()) {
+                        *listener = swarm.listen_on(circuit.clone()).ok();
+                    }
+                }
                 let any_admitted = !peer_addr.is_empty();
                 for addr in redial_targets(&bootstrap, |p| swarm.is_connected(p), any_admitted) {
                     let _ = swarm.dial(redial_opts(addr));
@@ -942,16 +1222,69 @@ async fn swarm_loop(
                     // PeerId, and admit-or-drop against the authorized set.
                     // PBA-L6b-006: every new connection starts GATED — no gossip in or out — until
                     // `identify` admits it; the sweep above drops it if it never identifies.
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                        let kind = if endpoint.is_relayed() { LinkKind::Relayed } else { LinkKind::Direct };
+                        conn_kind.insert(connection_id, (peer_id, kind));
                         if !peer_addr.contains_key(&peer_id) {
                             gate_peer(&mut swarm, &peer_id);
                             unidentified.entry(peer_id).or_insert_with(Instant::now);
+                        } else {
+                            refresh_links(&conn_kind, &peer_addr, &shared);
+                            if let Some(a) = peer_addr.get(&peer_id) {
+                                eprintln!("cluster-mesh: t={} {a} connected {}", now_ms(), kind.as_str());
+                            }
+                        }
+                    }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        if !relays_started && link_of(&address) == LinkKind::Direct {
+                            relays_started = true;
+                            for (circuit, listener) in relay_listen.iter_mut() {
+                                *listener = swarm.listen_on(circuit.clone()).ok();
+                            }
+                        }
+                    }
+                    SwarmEvent::ListenerClosed { listener_id, .. } => {
+                        for (_, l) in relay_listen.iter_mut().filter(|(_, l)| *l == Some(listener_id)) {
+                            *l = None;
+                        }
+                    }
+                    SwarmEvent::Behaviour(ClusterBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. },
+                    )) => {
+                        if !renewal {
+                            if let Ok(mut s) = shared.lock() {
+                                s.nat.reservations_accepted += 1;
+                            }
+                            eprintln!("cluster-mesh: t={} relay {relay_peer_id} reservation accepted", now_ms());
+                        }
+                    }
+                    SwarmEvent::Behaviour(ClusterBehaviourEvent::Dcutr(dcutr::Event {
+                        remote_peer_id,
+                        result,
+                    })) => {
+                        let ok = result.is_ok();
+                        if let Ok(mut s) = shared.lock() {
+                            if ok {
+                                s.nat.hole_punch_ok += 1;
+                            } else {
+                                s.nat.hole_punch_failed += 1;
+                            }
+                        }
+                        match result {
+                            Ok(_) => eprintln!("cluster-mesh: t={} hole punch to {remote_peer_id} ok", now_ms()),
+                            Err(e) => eprintln!("cluster-mesh: t={} hole punch to {remote_peer_id} failed: {e}", now_ms()),
                         }
                     }
                     SwarmEvent::Behaviour(ClusterBehaviourEvent::Identify(
                         identify::Event::Received { peer_id, info, .. },
                     )) => {
                         unidentified.remove(&peer_id);
+                        if relay_ids.contains(&peer_id) {
+                            // V60 S0-NAT-SPIKE: a configured relay. Keep the connection (it carries
+                            // our reservation) but never admit it: it stays gated in gossipsub and
+                            // out of `connected`.
+                            continue;
+                        }
                         if info.public_key.to_peer_id() != peer_id {
                             // Key does not match the Noise-authenticated PeerId — refuse.
                             let _ = swarm.disconnect_peer_id(peer_id);
@@ -966,10 +1299,20 @@ async fn swarm_loop(
                             .map(|s| s.authorized.contains(&address))
                             .unwrap_or(false);
                         if authorized {
+                            let fresh = !peer_addr.contains_key(&peer_id);
                             peer_addr.insert(peer_id, address.clone());
                             ungate_peer(&mut swarm, &peer_id);
                             if let Ok(mut s) = shared.lock() {
-                                s.connected.insert(address);
+                                s.connected.insert(address.clone());
+                            }
+                            refresh_links(&conn_kind, &peer_addr, &shared);
+                            if fresh {
+                                let kind = shared
+                                    .lock()
+                                    .ok()
+                                    .and_then(|s| s.links.get(&address).copied())
+                                    .unwrap_or(LinkKind::Direct);
+                                eprintln!("cluster-mesh: t={} {address} admitted {}", now_ms(), kind.as_str());
                             }
                         } else {
                             // Not in the group's allowed set → keep it gated and drop the connection.
@@ -1041,7 +1384,12 @@ async fn swarm_loop(
                     }
                     // Only forget the peer once its LAST connection is gone (up to
                     // MAX_ESTABLISHED_PER_PEER may be open).
-                    SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                    SwarmEvent::ConnectionClosed { connection_id, num_established: 1.., .. } => {
+                        conn_kind.remove(&connection_id);
+                        refresh_links(&conn_kind, &peer_addr, &shared);
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established: 0, .. } => {
+                        conn_kind.remove(&connection_id);
                         unidentified.remove(&peer_id);
                         // Lift the blacklist so a later reconnect is handled afresh (gossipsub
                         // ignores a blacklisted peer's new connection entirely, which would stop us
@@ -1054,6 +1402,7 @@ async fn swarm_loop(
                         if let Some(address) = peer_addr.remove(&peer_id) {
                             if let Ok(mut s) = shared.lock() {
                                 s.connected.remove(&address);
+                                s.links.remove(&address);
                             }
                         }
                     }
@@ -1095,12 +1444,15 @@ pub(crate) fn redial_opts(addr: Multiaddr) -> DialOpts {
     }
 }
 
-/// The peer id a bootstrap multiaddr names (its trailing `/p2p/<id>`), if any.
+/// The peer id a bootstrap multiaddr names (its LAST `/p2p/<id>`), if any. V60 S0-NAT-SPIKE: a
+/// circuit address `<relay>/p2p/<relay id>/p2p-circuit/p2p/<target>` names the target, not the relay.
 fn bootstrap_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|p| match p {
-        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
-        _ => None,
-    })
+    addr.iter()
+        .filter_map(|p| match p {
+            libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+            _ => None,
+        })
+        .last()
 }
 
 /// HUP-S8.4: the bootstrap addresses due for a re-dial. An address naming a peer id is due while
@@ -1215,7 +1567,8 @@ pub(crate) fn seed_addrs_from(listeners: &[Multiaddr], local: &PeerId) -> Vec<Mu
     let mut loopback: Vec<Multiaddr> = Vec::new();
     for a in listeners {
         let mut with_id = a.clone();
-        if bootstrap_peer_id(&with_id).is_none() {
+        // A circuit listener (`<relay>/p2p/<relay id>/p2p-circuit`) still needs our id at the end.
+        if !matches!(with_id.iter().last(), Some(Protocol::P2p(_))) {
             with_id.push(Protocol::P2p(*local));
         }
         match class(a) {

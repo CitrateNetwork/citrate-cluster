@@ -88,9 +88,10 @@ fn wait_connected(t: &Libp2pTransport, addr: &str, within: Duration) -> bool {
 fn the_target_of_a_circuit_address_is_its_last_peer_id() {
     let relay_id = peer_of(0x51);
     let target = peer_of(0x52);
-    let circuit: Multiaddr = format!("/ip4/10.0.0.1/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}")
-        .parse()
-        .expect("circuit multiaddr");
+    let circuit: Multiaddr =
+        format!("/ip4/10.0.0.1/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}")
+            .parse()
+            .expect("circuit multiaddr");
     assert_eq!(bootstrap_peer_id(&circuit), Some(target));
     // A seed carrying the circuit address names the target, not the relay: a node must not refuse
     // its own circuit address as "another peer", nor accept it as one.
@@ -106,8 +107,13 @@ fn relay_addresses_must_name_the_relay_and_not_a_circuit() {
     assert_eq!(parsed.len(), 1);
     assert_eq!(bootstrap_peer_id(&parsed[0]), Some(id));
 
-    assert!(parse_relay_addrs("").expect("empty is no relays").is_empty());
-    assert!(parse_relay_addrs("/ip4/10.0.0.1/tcp/4001").is_err(), "no peer id");
+    assert!(parse_relay_addrs("")
+        .expect("empty is no relays")
+        .is_empty());
+    assert!(
+        parse_relay_addrs("/ip4/10.0.0.1/tcp/4001").is_err(),
+        "no peer id"
+    );
     assert!(
         parse_relay_addrs(&format!("{good}/p2p-circuit")).is_err(),
         "a circuit is not a relay"
@@ -139,12 +145,17 @@ fn a_peer_view_without_a_link_serializes_as_before() {
         link: None,
     };
     let json = serde_json::to_string(&v).expect("json");
-    assert!(!json.contains("link"), "older clients see the same line: {json}");
+    assert!(
+        !json.contains("link"),
+        "older clients see the same line: {json}"
+    );
     let v = crate::ipc::PeerView {
         link: Some("relayed".into()),
         ..v
     };
-    assert!(serde_json::to_string(&v).expect("json").contains("\"link\":\"relayed\""));
+    assert!(serde_json::to_string(&v)
+        .expect("json")
+        .contains("\"link\":\"relayed\""));
 }
 
 #[test]
@@ -153,7 +164,11 @@ fn a_member_reserves_on_an_allowed_relay_and_offers_the_circuit_in_its_seed() {
     let a = member(0x61, "g-relay-seed", vec![raddr]);
     let seed = wait_circuit_seed(&a, Duration::from_secs(10))
         .expect("the member's seed offers a relayed address once its reservation is accepted");
-    assert_eq!(bootstrap_peer_id(&seed), Some(peer_of(0x61)), "the circuit names the member");
+    assert_eq!(
+        bootstrap_peer_id(&seed),
+        Some(peer_of(0x61)),
+        "the circuit names the member"
+    );
     assert!(r.stats().reservations_accepted >= 1);
     assert_eq!(a.nat_stats().reservations_accepted, 1);
 }
@@ -168,7 +183,10 @@ fn a_relay_refuses_a_member_outside_its_allow_list() {
     );
     let s = r.stats();
     assert_eq!(s.reservations_accepted, 0);
-    assert!(!s.connected.contains(&peer_of(0x64)), "the connection itself is refused");
+    assert!(
+        !s.connected.contains(&peer_of(0x64)),
+        "the connection itself is refused"
+    );
 }
 
 #[test]
@@ -186,10 +204,22 @@ fn two_members_mesh_through_a_relay_and_the_relay_is_never_a_mesh_peer() {
     // A knows B ONLY by its relayed address.
     assert_eq!(a.add_peers(&[b_circuit.to_string()]).expect("seeded"), 1);
 
-    assert!(wait_connected(&a, &addr_b, Duration::from_secs(15)), "A meshed with B");
-    assert!(wait_connected(&b, &addr_a, Duration::from_secs(5)), "B meshed with A");
-    assert!(r.stats().circuits_accepted >= 1, "the first connection went through the relay");
-    assert!(a.links().contains_key(&addr_b), "A reports a link kind for B");
+    assert!(
+        wait_connected(&a, &addr_b, Duration::from_secs(15)),
+        "A meshed with B"
+    );
+    assert!(
+        wait_connected(&b, &addr_a, Duration::from_secs(5)),
+        "B meshed with A"
+    );
+    assert!(
+        r.stats().circuits_accepted >= 1,
+        "the first connection went through the relay"
+    );
+    assert!(
+        a.links().contains_key(&addr_b),
+        "A reports a link kind for B"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut got = None;
@@ -227,4 +257,34 @@ fn admission_still_decides_a_relayed_connection() {
         !wait_connected(&a, &stranger_addr, Duration::from_secs(4)),
         "a peer outside the group is refused over the relay exactly as over TCP"
     );
+}
+
+#[test]
+fn dcutr_upgrades_a_relayed_link_to_direct_when_a_direct_path_exists() {
+    // Loopback has no NAT, so the hole punch must succeed: this proves the DCUtR wiring (address
+    // candidates from the relay connection on the listen port, the group prologue on the punched
+    // connection, admission and link tracking across both connections). Whether it gets through a
+    // real NAT is the netns spike's question.
+    const GROUP: &str = "g-relay-dcutr";
+    let (_r, raddr) = relay(0x70, &[0x71, 0x72]);
+    let mut a = member(0x71, GROUP, vec![raddr.clone()]);
+    let mut b = member(0x72, GROUP, vec![raddr]);
+    let addr_a = a.self_address().to_string();
+    let addr_b = b.self_address().to_string();
+    a.authorize(&addr_b);
+    b.authorize(&addr_a);
+    let b_circuit = wait_circuit_seed(&b, Duration::from_secs(10)).expect("B reserved");
+    a.add_peers(&[b_circuit.to_string()]).expect("seeded");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let direct = |t: &Libp2pTransport, peer: &str| t.links().get(peer) == Some(&LinkKind::Direct);
+    while Instant::now() < deadline && !(direct(&a, &addr_b) && direct(&b, &addr_a)) {
+        sleep(Duration::from_millis(50));
+    }
+    assert!(
+        direct(&a, &addr_b) && direct(&b, &addr_a),
+        "both sides report a direct link"
+    );
+    assert!(a.nat_stats().hole_punch_ok + b.nat_stats().hole_punch_ok >= 1);
+    assert_eq!(a.link(&addr_b), Some("direct"));
 }

@@ -367,6 +367,7 @@ dependencies = [
  "k256",
  "libc",
  "libp2p",
+ "multistream-select",
  "serde",
  "serde_json",
  "sha3",
