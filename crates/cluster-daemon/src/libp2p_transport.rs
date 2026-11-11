@@ -1268,3 +1268,7 @@ mod libp2p_transport_tests;
 #[cfg(test)]
 #[path = "libp2p_discovery_tests.rs"]
 mod libp2p_discovery_tests;
+
+#[cfg(test)]
+#[path = "libp2p_relay_tests.rs"]
+mod libp2p_relay_tests;
