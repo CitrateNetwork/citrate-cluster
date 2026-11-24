@@ -15,9 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Rust 1.96.0: the toolchain citrate-core builds the shipped cluster-daemon with
+      # (citrate-core release/components.json toolchain.rust). Not `stable`: Rust 1.100 (2026-11-09)
+      # made Infallible an alias of `!`, and libp2p-swarm-derive 0.35.1's NetworkBehaviour expansion
+      # then trips unreachable_code ("unreachable call") on behaviours whose handler event is
+      # Infallible (connection_limits, allow_block_list). Upstream allows it inside the macro
+      # (rust-libp2p swarm-derive, unreleased after 0.36.0); move to stable once that ships.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.96.0"
           components: rustfmt, clippy
       - name: rustfmt
         run: cargo fmt --all --check
@@ -40,9 +46,15 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Rust 1.96.0: the toolchain citrate-core builds the shipped cluster-daemon with
+      # (citrate-core release/components.json toolchain.rust). Not `stable`: Rust 1.100 (2026-11-09)
+      # made Infallible an alias of `!`, and libp2p-swarm-derive 0.35.1's NetworkBehaviour expansion
+      # then trips unreachable_code ("unreachable call") on behaviours whose handler event is
+      # Infallible (connection_limits, allow_block_list). Upstream allows it inside the macro
+      # (rust-libp2p swarm-derive, unreleased after 0.36.0); move to stable once that ships.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.96.0"
           components: clippy
       - name: clippy
         run: cargo clippy -p cluster-daemon --all-targets --locked -- -D warnings
