@@ -30,6 +30,10 @@ subtle = "2"
 # behind one `local_socket` seam. The IPC server is std-sync/blocking (one thread per connection), so
 # the sync API is used — NOT the "tokio" feature (which is only for libp2p, a separate seam).
 interprocess = "2"
+# Windows pipe name (PBA-L7b-004): the per-install name citrate-core's client connects to is a
+# SHA-256 over the socket path and a 32-byte random nonce. Both already in the tree (Cargo.lock).
+sha2 = "0.10"
+getrandom = "0.2"
 # CL-S1: the real cross-machine mesh (Noise + gossipsub). These live in the daemon ONLY;
 # cluster-core must never link libp2p/tokio (CLAUDE.md rule 3 — verified in CI-equivalent grep).
 libp2p = { workspace = true }

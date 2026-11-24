@@ -36,7 +36,14 @@ fn short_sock(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() % 100_000_000)
         .unwrap_or(0);
-    PathBuf::from(format!("/tmp/ctzc-{tag}-{n}.sock"))
+    // Unix: /tmp keeps the path under SUN_LEN. Windows: the endpoint is a named pipe, but its
+    // per-install nonce file (`<sock>.pipe-nonce`, PBA-L7b-004) sits beside the socket path, so the
+    // directory must exist there; /tmp does not on Windows.
+    #[cfg(unix)]
+    let dir = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir();
+    dir.join(format!("ctzc-{tag}-{n}.sock"))
 }
 
 fn spawn_server(sock: &Path, bearer: &str) {
@@ -107,14 +114,20 @@ fn a_silent_connection_does_not_wedge_the_control_surface() {
     // timeout makes the buggy (serial, head-of-line-blocking) case fail cleanly instead of hanging.
     let start = std::time::Instant::now();
     let stream = connect(&sock).expect("victim connects");
-    stream
-        .set_recv_timeout(Some(std::time::Duration::from_secs(3)))
-        .unwrap();
     let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
     writeln!(w, "{{\"token\":\"{bearer}\"}}").unwrap();
-    let mut line = String::new();
-    let _ = r.read_line(&mut line);
+    // The read is bounded by a channel timeout rather than a socket read timeout: Windows named
+    // pipes do not support I/O timeouts (interprocess: "named pipes do not support I/O timeouts").
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut r = BufReader::new(stream);
+        let mut line = String::new();
+        let _ = r.read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap_or_default();
     assert!(
         line.contains("ready"),
         "a second client must handshake despite a silent connection (head-of-line): got {line:?}"
