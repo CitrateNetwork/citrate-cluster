@@ -114,14 +114,20 @@ fn a_silent_connection_does_not_wedge_the_control_surface() {
     // timeout makes the buggy (serial, head-of-line-blocking) case fail cleanly instead of hanging.
     let start = std::time::Instant::now();
     let stream = connect(&sock).expect("victim connects");
-    stream
-        .set_recv_timeout(Some(std::time::Duration::from_secs(3)))
-        .unwrap();
     let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
     writeln!(w, "{{\"token\":\"{bearer}\"}}").unwrap();
-    let mut line = String::new();
-    let _ = r.read_line(&mut line);
+    // The read is bounded by a channel timeout rather than a socket read timeout: Windows named
+    // pipes do not support I/O timeouts (interprocess: "named pipes do not support I/O timeouts").
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut r = BufReader::new(stream);
+        let mut line = String::new();
+        let _ = r.read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap_or_default();
     assert!(
         line.contains("ready"),
         "a second client must handshake despite a silent connection (head-of-line): got {line:?}"
