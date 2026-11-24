@@ -36,7 +36,14 @@ fn short_sock(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() % 100_000_000)
         .unwrap_or(0);
-    PathBuf::from(format!("/tmp/ctzc-{tag}-{n}.sock"))
+    // Unix: /tmp keeps the path under SUN_LEN. Windows: the endpoint is a named pipe, but its
+    // per-install nonce file (`<sock>.pipe-nonce`, PBA-L7b-004) sits beside the socket path, so the
+    // directory must exist there; /tmp does not on Windows.
+    #[cfg(unix)]
+    let dir = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir();
+    dir.join(format!("ctzc-{tag}-{n}.sock"))
 }
 
 fn spawn_server(sock: &Path, bearer: &str) {
