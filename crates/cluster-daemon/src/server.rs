@@ -27,13 +27,18 @@ use crate::transport::MeshTransport;
 use crate::ClusterDaemon;
 
 /// Map a socket path to the platform's local-socket [`Name`] (issue #1). BOTH ends — this daemon and
-/// the citrate-core client — apply this EXACT rule, so the endpoints agree byte-for-byte:
+/// the citrate-core client (`src-tauri/src/ipc_name.rs`) — apply this EXACT rule, so the endpoints
+/// agree byte-for-byte:
 ///
 /// * **Unix:** the filesystem path is used verbatim (a Unix-domain socket at that path).
-/// * **Windows:** named pipes live in a flat namespace, not the filesystem, so the *basename* of the
-///   path is slugged — every char outside `[A-Za-z0-9._-]` becomes `-` — and used as a namespaced name.
+/// * **Windows:** a per-user, per-install namespaced pipe (citrate-core PBA-L7b-004):
+///   `citrate-<hex(sha256("citrate/ipc-pipe/v1" || P || NUL || nonce))[..32]>-<slug>`, where `nonce`
+///   is the 32 bytes in `<P>.pipe-nonce` and `slug` is the basename of `P` with every char outside
+///   `[A-Za-z0-9._-]` replaced by `-`. See [`windows_pipe_name`] and [`pipe_nonce`].
 ///
-/// The rule is fixed; only the interprocess 2.x call spelling is adapted per platform.
+/// Until this matched (citrate-core has used the per-install name since PBA-L7b-004), the daemon bound
+/// the bare slug on Windows while the app connected to the per-install name, so the app never reached
+/// the daemon and its health probe failed (the same defect citrate-comms fixed in its #24).
 pub fn endpoint_name(p: &str) -> io::Result<Name<'static>> {
     #[cfg(unix)]
     {
@@ -41,21 +46,149 @@ pub fn endpoint_name(p: &str) -> io::Result<Name<'static>> {
     }
     #[cfg(windows)]
     {
-        let base = std::path::Path::new(p)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("citrate.sock");
-        let slug: String = base
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        slug.to_ns_name::<GenericNamespaced>()
+        let nonce = pipe_nonce(p)?;
+        windows_pipe_name(p, &nonce).to_ns_name::<GenericNamespaced>()
+    }
+}
+
+/// The length of the per-install pipe nonce (citrate-core `ipc_name::PIPE_NONCE_LEN`).
+pub const PIPE_NONCE_LEN: usize = 32;
+
+/// PBA-L7b-004: the Windows pipe name for endpoint path `p` and per-install `nonce`. A pure function,
+/// unit-tested on every platform against citrate-core's golden vector. MUST stay byte-identical to
+/// citrate-core `src-tauri/src/ipc_name.rs::windows_pipe_name`.
+#[cfg_attr(unix, allow(dead_code))]
+pub fn windows_pipe_name(p: &str, nonce: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let base = std::path::Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("citrate.sock");
+    let slug: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut h = Sha256::new();
+    h.update(b"citrate/ipc-pipe/v1");
+    h.update(p.as_bytes());
+    h.update([0u8]);
+    h.update(nonce);
+    let tag = hex::encode(&h.finalize()[..16]);
+    format!("citrate-{tag}-{slug}")
+}
+
+/// Read the per-install pipe nonce for `p` from `<p>.pipe-nonce`, creating it (32 random bytes,
+/// `create_new`) on first use. Whichever end runs first (this daemon at bind, or the app at connect)
+/// creates it; a concurrent creator loses the `create_new` race and reads the winner's bytes, so both
+/// ends always agree. The file lives in the member's per-user data dir. MUST match citrate-core
+/// `ipc_name::pipe_nonce`.
+#[cfg_attr(unix, allow(dead_code))]
+pub fn pipe_nonce(p: &str) -> io::Result<[u8; PIPE_NONCE_LEN]> {
+    let path = format!("{p}.pipe-nonce");
+    let read = |path: &str| -> io::Result<[u8; PIPE_NONCE_LEN]> {
+        let mut buf = Vec::with_capacity(PIPE_NONCE_LEN);
+        std::fs::File::open(path)?
+            .take(PIPE_NONCE_LEN as u64 + 1)
+            .read_to_end(&mut buf)?;
+        buf.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pipe nonce file has the wrong length",
+            )
+        })
+    };
+    match read(&path) {
+        Ok(n) => return Ok(n),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        Err(_) => {}
+    }
+    let mut nonce = [0u8; PIPE_NONCE_LEN];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|e| io::Error::other(format!("pipe nonce rng: {e}")))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
+        Ok(mut f) => {
+            f.write_all(&nonce)?;
+            Ok(nonce)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read(&path),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod pipe_name_tests {
+    use super::*;
+
+    /// The vector citrate-core (`ipc_name::tests::pipe_name_matches_comms_golden_vector`) and
+    /// citrate-comms (#24) pin: the same input gives the same name in all three repos.
+    #[test]
+    fn pipe_name_matches_citrate_core_golden_vector() {
+        assert_eq!(
+            windows_pipe_name("/tmp/citrate/comms/member.sock", &[0x11u8; 32]),
+            "citrate-5fcf8fcf99579dd1e993f1710d0595c3-member.sock"
+        );
+    }
+
+    /// The cluster socket's own name, computed independently (sha256 over the same domain-separated
+    /// input), so a change to the slug or the hash input fails here.
+    #[test]
+    fn cluster_socket_pipe_name_vector() {
+        assert_eq!(
+            windows_pipe_name("/tmp/citrate/cluster/cluster.sock", &[0x33u8; 32]),
+            "citrate-d19a6795b6582c8a7bc9e39d5f5ab182-cluster.sock"
+        );
+    }
+
+    /// Two installs (different nonces) and two users (different paths) never share a pipe name, and
+    /// the name is never the bare basename the daemon used to bind.
+    #[test]
+    fn pipe_name_is_per_install_and_per_path() {
+        let a = windows_pipe_name("C:\\Users\\a\\cluster.sock", &[1u8; 32]);
+        let b = windows_pipe_name("C:\\Users\\a\\cluster.sock", &[2u8; 32]);
+        let c = windows_pipe_name("C:\\Users\\b\\cluster.sock", &[1u8; 32]);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, "cluster.sock");
+        assert!(
+            a.starts_with("citrate-") && a.ends_with("-cluster.sock"),
+            "{a}"
+        );
+    }
+
+    /// The nonce is created once, then read back identically; a file of the wrong length is refused.
+    #[test]
+    fn pipe_nonce_is_created_once_and_stable() {
+        let dir = std::env::temp_dir().join(format!("cluster-pipe-nonce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("cluster.sock");
+        let p = sock.to_str().unwrap();
+        let first = pipe_nonce(p).unwrap();
+        let again = pipe_nonce(p).unwrap();
+        assert_eq!(first, again);
+        assert_eq!(
+            std::fs::read(format!("{p}.pipe-nonce")).unwrap(),
+            first.to_vec()
+        );
+        std::fs::write(format!("{p}.pipe-nonce"), [0u8; 5]).unwrap();
+        assert_eq!(
+            pipe_nonce(p).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

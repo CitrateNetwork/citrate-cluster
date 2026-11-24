@@ -32,3 +32,19 @@ jobs:
           cargo test -p cluster-daemon --features mdns --locked
       - name: build release
         run: cargo build --release -p cluster-daemon
+
+  # The Windows IPC transport (a named pipe whose per-install name must match citrate-core's client,
+  # PBA-L7b-004) only compiles and runs on Windows: build the daemon and run its tests there.
+  windows:
+    name: rust (windows, cluster-daemon test)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: clippy
+        run: cargo clippy -p cluster-daemon --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test -p cluster-daemon --locked
