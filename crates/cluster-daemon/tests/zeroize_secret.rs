@@ -28,6 +28,7 @@ fn libp2p_config_zeroizes_secret_on_drop() {
         group_id: "cl-b-001-test".to_string(),
         bootstrap: Vec::new(),
         mdns: false,
+        relays: vec![],
     });
 
     // Address of the secret field, captured before the destructor runs.

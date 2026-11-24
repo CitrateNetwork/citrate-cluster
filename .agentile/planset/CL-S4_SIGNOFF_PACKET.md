@@ -103,3 +103,43 @@ Added after the draft above; review these with it. Nothing here is signed or swi
   until patched versions exist or the security lead accepts them in writing.
 * **Re-dial from a new source port.** Fixes re-admission from macOS after a refusal (TIME_WAIT).
   Each re-dial is a fresh TCP connection; the per-tick and per-list caps are unchanged.
+
+## V60 S0-NAT-SPIKE (2026-11-11, branch `v60/s0-nat-spike`): new surface to review
+
+Added by the NAT spike; review with the sections above. Nothing here is signed or deployed. Results
+and the findings that MESH-3 must close are in `scripts/nat-spike/RESULTS.md`.
+
+* **Hand-written TCP upgrade** (`mesh_tcp_transport`, `secure_and_multiplex`). The swarm no longer
+  uses libp2p's upgrade builder for TCP: it negotiates multistream-select (V1Lazy), Noise and yamux
+  itself so it can choose the Noise prologue per connection. The steps are the builder's; review
+  them as new code (the dialer/listener choice follows `role_override`, as the builder's does).
+* **Two prologues.** A TCP connection this node DIALS to a configured relay's PeerId uses
+  `/citrate/cluster-relay/1`; every other TCP connection, and the end-to-end Noise session through a
+  relay, uses the group id (C4 still holds between members). A peer cannot make us use the relay
+  prologue: it is chosen only from our own relay list and only for our outbound dials.
+* **A configured relay is never admitted.** It is identified, kept connected (it holds our
+  reservation) and gated in gossipsub, and never enters `connected` (C1 unchanged). Admission over
+  a relayed connection is decided at identify exactly as over TCP
+  (`admission_still_decides_a_relayed_connection`).
+* **The relay node** (`relay_node`, `examples/spike_relay`) refuses every connection from a peer
+  off its allow list before any relay request is read. It sees only Noise ciphertext between
+  members. It is not deployable as is: MESH-3 gates reservations on a signed DeviceLink and fixes
+  multi-group circuit routing (one PeerId per device, several group swarms).
+* **Relay limits** (`MAX_CIRCUIT_DURATION` 30 min, `MAX_CIRCUIT_BYTES` 4 MiB, 128 reservations, 64
+  circuits). The 30 min and 4 MiB limits were owner-approved on 2026-11-11; production relay hosts still need a separate owner go.
+* **Dependencies:** adds `libp2p-relay` 0.21.1 and `libp2p-dcutr` 0.14.1 (libp2p 0.56 features)
+  and a direct `multistream-select` 0.13 dependency (already in the tree). `cargo audit` to be run
+  on the commit being signed.
+
+## V60 MESH-3 (2026-11-11, branch `v60/mesh-3-group-peer-ids`): group keys, new surface to review
+
+* **A second way to resolve a peer's address at identify.** A peer whose own key's address is not
+  authorized may present a group-key binding (`group_key::verify`): an EIP-191 signature by a
+  device key over `citrate-cluster group key v1`, the group id and the presenting PeerId. The peer
+  is admitted as the recovered address only if the group authorizes it. C1 holds: `connected`
+  only ever gains authorized addresses, and eviction by address drops every PeerId mapped to it.
+  The TLA models admission by address and are unchanged; to be re-run on the commit being signed.
+* **Group key derivation.** keccak256 of a tag, the group id (length-prefixed), the device secret
+  and a counter; intermediates zeroized. Only when relays are configured.
+* **Disclosure.** The binding tells anyone who completes a Noise handshake and identify which device
+  address a group PeerId acts for, the same as the device PeerId already did.

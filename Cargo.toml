@@ -26,6 +26,10 @@ libp2p = { version = "0.56", features = [
     "identify",
     "macros",
     "secp256k1",
+    # V60 S0-NAT-SPIKE: NAT traversal. Circuit relay v2 (client in the daemon, server in the relay
+    # node) and DCUtR hole punching. AutoNAT is not built yet (see scripts/nat-spike/RESULTS.md).
+    "relay",
+    "dcutr",
 ] }
 tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
 futures = "0.3"

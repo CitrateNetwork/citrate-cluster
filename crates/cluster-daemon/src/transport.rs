@@ -31,6 +31,11 @@ pub trait MeshTransport: ClusterTransport {
     /// HUP-S8.4: the addresses another machine can dial this node on for this group, each naming
     /// this node's peer id (what a group seed carries). A transport with no network refuses.
     fn seed_addrs(&self) -> Result<Vec<String>, String>;
+    /// V60 S0-NAT-SPIKE: how a connected peer is reached, `"direct"` or `"relayed"`. `None` when
+    /// the transport does not know (the in-process transport has no network path to report).
+    fn link(&self, _addr: &str) -> Option<&'static str> {
+        None
+    }
 }
 
 /// The honest answer of a transport with no cross-machine mesh to a seed request.

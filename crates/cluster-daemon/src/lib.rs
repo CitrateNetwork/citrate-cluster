@@ -17,8 +17,10 @@ use cluster_core::device::{device_roster, effective_roster, DeviceRegistry};
 use cluster_core::ClusterSession;
 
 pub mod devices;
+pub mod group_key;
 pub mod ipc;
 pub mod libp2p_transport;
+pub mod relay_node;
 pub mod server;
 pub mod transport;
 
@@ -464,10 +466,15 @@ impl<T: MeshTransport> ClusterDaemon<T> {
                 let member = registry
                     .and_then(|r| r.member_of(&address))
                     .map(str::to_string);
+                let link = online
+                    .then(|| s.transport().link(&address))
+                    .flatten()
+                    .map(str::to_string);
                 PeerView {
                     address,
                     online,
                     member,
+                    link,
                 }
             })
             .collect()

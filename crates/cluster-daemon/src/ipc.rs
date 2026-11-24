@@ -75,6 +75,10 @@ pub struct PeerView {
     /// own identity (and on the wire from an older daemon).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<String>,
+    /// V60 S0-NAT-SPIKE: how an online peer is reached, `"direct"` or `"relayed"` (the cluster map
+    /// draws a solid or a dashed edge). Absent when offline or unknown (and from an older daemon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// One received message (a peer's gossipsub publication).
